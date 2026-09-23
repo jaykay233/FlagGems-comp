@@ -19,6 +19,9 @@ import flag_gems
 
 from . import accuracy_utils as utils
 
+# CI trigger: touch this file so the changed-files matrix runs abs on the
+# migrated klx-p800 kunlunxin runner, verifying it executes real operator tests.
+
 
 @pytest.mark.abs
 @pytest.mark.parametrize("shape", utils.POINTWISE_SHAPES)
