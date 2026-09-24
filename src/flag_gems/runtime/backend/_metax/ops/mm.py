@@ -32,6 +32,81 @@ EXPAND_CONFIG_FILENAME = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "mm_metax_expand.yaml")
 )
 
+# ---------------------------------------------------------------------------
+# M == 1 (decode) GEMV fast path
+# ---------------------------------------------------------------------------
+# At M == 1 the per-layer projections are pure memory-bound GEMV work: the
+# weight matrix is streamed once and nothing is reused, so the only thing that
+# matters is achieved bandwidth.  The dense/split-k tiles are shaped for
+# M > 1 and leave most of the machine idle at M == 1.
+#
+# Measured on MetaX C500 (104 SMs), bf16, one decode layer:
+#
+#   shape      M     N      K    weight   mm kernel            GB/s    GEMV   GB/s
+#   qkv        1  2560   2048    10.5 MB  mm_kernel_nt       699     13.2   792
+#   gate_up    1 12288   2048    50.3 MB  mm_kernel_nt      1275     39.0  1289
+#   o_proj     1  2048   2048     8.4 MB  mm_kernel_splitk   625     11.4  739
+#   down       1  2048   6144    25.2 MB  mm_kernel_splitk   862     23.0 1095
+#   ------------------------------------  --------------           -----------
+#   total                                97.1 us                  86.6 us
+#
+# i.e. ~1.12x on the four projections (42 layers -> ~440 us/step).  The split-k
+# cases additionally lose a whole `c.zero_()` launch (the kernel accumulates
+# with tl.atomic_add, so the accumulator must start at zero).
+#
+# `_gemv_kernel` already exists for the lm_head projection in `linear.py` and is
+# reused here rather than duplicated.  The only layout requirement is that `b`
+# is a transposed view of the `[N, K]` weight -- exactly what vLLM's Linear
+# passes as `weight.t()` -- so it can be reinterpreted without a copy.
+_ENABLE_MM_GEMV = os.environ.get("FLAG_GEMS_METAX_MM_GEMV", "1") != "0"
+_gemv_module = None
+
+
+def _m1_gemv(a, b, c, M, N, K):
+    """Run the M == 1 GEMV kernel into ``c``; return ``c``, or ``None`` to fall
+    back to the regular mm dispatch when the layout/support checks fail."""
+    if not _ENABLE_MM_GEMV or M != 1 or N <= 0 or K <= 0:
+        return None
+    if a.dtype not in _ordered_datatypes or b.dtype not in _ordered_datatypes:
+        return None
+    if a.dtype != b.dtype or c.dtype != a.dtype:
+        return None
+    # a: (1, K) with K contiguous; b: transposed view of an (N, K) weight,
+    # i.e. (K, N) with stride (1, K); c: contiguous (1, N) output buffer.
+    if a.stride() != (K, 1) or b.stride() != (1, K):
+        return None
+    if not c.is_contiguous():
+        return None
+
+    global _gemv_module
+    if _gemv_module is None:
+        # ``flag_gems..._metax.ops`` re-exports a *function* named ``linear``,
+        # so ``from . import linear`` would bind that instead of the module.
+        import importlib
+
+        _gemv_module = importlib.import_module(
+            "flag_gems.runtime.backend._metax.ops.linear"
+        )
+
+    weight = b.t()  # (N, K) view, no copy
+    out = c.view(N) if c.dim() == 2 else c
+    grid = (triton.cdiv(N, _gemv_module._BLOCK_N),)
+    with torch_device_fn.device(a.device):
+        _gemv_module._gemv_kernel[grid](
+            a,
+            weight,
+            weight,
+            out,
+            N,
+            K,
+            weight.stride(0),
+            BIAS=False,
+            BLOCK_N=_gemv_module._BLOCK_N,
+            BLOCK_K=_gemv_module._BLOCK_K,
+            num_warps=_gemv_module._NUM_WARPS,
+        )
+    return c
+
 
 def _prune_mm_dense_configs(configs, named_args, transposed_b=False, **kwargs):
     configs = list(configs)
@@ -1177,6 +1252,9 @@ def mm(a, b):
     # allocates output
     c_dtype = get_higher_dtype(a.dtype, b.dtype)
     c = torch.empty((M, N), device=device, dtype=c_dtype)
+    gemv_out = _m1_gemv(a, b, c, M, N, K)
+    if gemv_out is not None:
+        return gemv_out
     if N == 1:
         if _gemv_k_parallel_scenario(M, K):
             return gemv_mm_k_parallel(a, b, c, M, K)
@@ -1207,6 +1285,9 @@ def mm_out(a, b, *, out):
     _, N = b.shape
     # allocates output
     c = out
+    gemv_out = _m1_gemv(a, b, c, M, N, K)
+    if gemv_out is not None:
+        return gemv_out
     if N == 1:
         if _gemv_k_parallel_scenario(M, K):
             return gemv_mm_k_parallel(a, b, c, M, K)
