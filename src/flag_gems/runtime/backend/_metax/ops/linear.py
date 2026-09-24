@@ -207,6 +207,31 @@ def linear(input, weight, bias=None):
                 _trace(dim, M, N, K, "gemv")
                 return _linear_gemv(input, weight, bias, dim, K, N)
 
+    # M > 1 (prefill / batched decode): the generic linear_kernel is markedly
+    # slower than this backend's own tuned mm kernels for the very same GEMM.
+    # Measured on MetaX C500 / MiniCPM5-2B bf16, device time at M=2048:
+    #   down_proj 1.137 -> 0.570 ms   o_proj 0.297 -> 0.179
+    #   qkv       0.311 -> 0.238 ms   gate_up 1.270 -> 0.886
+    # so route the bias-free 2-D case through mm. mm already dispatches to the
+    # tuned nt / nn / splitk kernels.
+    if (
+        bias is None
+        and input.dim() == 2
+        and weight.dim() == 2
+        and input.dtype in _SUPPORTED_DTYPES
+        and weight.dtype in _SUPPORTED_DTYPES
+        and input.stride(-1) == 1
+        and weight.stride(-1) == 1
+    ):
+        _M, _K = input.shape
+        if _M > 1 and _K > 0 and weight.shape[0] > 0:
+            logger.debug("GEMS_METAX LINEAR (mm)")
+            _trace(2, _M, weight.shape[0], _K, "mm")
+
+            from .mm import mm as _mm
+
+            return _mm(input, weight.t())
+
     logger.debug("GEMS_METAX LINEAR (generic)")
     if weight.dim() == 2 and input.dim() in (1, 2):
         _M = 1 if input.dim() == 1 else input.shape[0]
