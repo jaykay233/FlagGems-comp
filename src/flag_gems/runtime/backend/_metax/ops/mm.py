@@ -169,6 +169,7 @@ _prune_mm_dense_configs_nt = functools.partial(
 @libtuner(
     configs=runtime.get_tuned_config("mm"),
     key=["M", "N", "K", "stride_am", "stride_bk"],
+    strategy=["align32", "align32", "align32", "align32", "align32"],
     prune_configs_by={"early_config_prune": _prune_mm_dense_configs},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm",
@@ -324,6 +325,7 @@ def mm_kernel(
 @libtuner(
     configs=runtime.get_tuned_config("mm_nn"),
     key=["M", "N", "K"],
+    strategy=["align32", "align32", "align32"],
     prune_configs_by={"early_config_prune": _prune_mm_dense_configs},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_nn",
@@ -405,6 +407,7 @@ def mm_kernel_nn(
 @libtuner(
     configs=runtime.get_tuned_config("mm_nt"),
     key=["M", "N", "K"],
+    strategy=["align32", "align32", "align32"],
     prune_configs_by={"early_config_prune": _prune_mm_dense_configs_nt},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_nt",
@@ -496,6 +499,7 @@ def _prune_gemv_configs(configs, named_args, **kwargs):
 @libtuner(
     configs=[triton.Config({"BLOCK_M": 32, "BLOCK_K": 256})],
     key=["M", "K", "stride_am", "stride_bk"],
+    strategy=["align32", "align32", "align32", "default"],
     prune_configs_by={"early_config_prune": _prune_gemv_configs},
     flagtune_op_name="mm",
     flagtune_expand_op_name="gemv",
@@ -555,6 +559,7 @@ def gemv_mm(a, b, c, M, K):
 @libtuner(
     configs=runtime.get_tuned_config("gemv_k_parallel"),
     key=["M", "K", "stride_am", "stride_bk"],
+    strategy=["align32", "align32", "align32", "default"],
     flagtune_op_name="mm",
     flagtune_expand_op_name="gemv_k_parallel",
     flagtune_yaml_path=EXPAND_CONFIG_FILENAME,
@@ -735,6 +740,7 @@ def _prune_mm_splitk_two_step_configs(configs, named_args, **kwargs):
 @libtuner(
     configs=runtime.get_tuned_config("mm_splitk"),
     key=["M", "N", "K", "stride_am", "stride_bk"],
+    strategy=["align32", "align32", "align32", "align32", "align32"],
     pre_hook=_reset_splitk_output,
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_splitk",
@@ -821,6 +827,7 @@ def splitk_mm(a, b, c, M, N, K):
 @libtuner(
     configs=runtime.get_tuned_config("mm_splitk_two_step"),
     key=["M", "N", "K", "stride_am", "stride_bk"],
+    strategy=["align32", "align32", "align32", "align32", "align32"],
     prune_configs_by={"early_config_prune": _prune_mm_splitk_two_step_configs},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_splitk_two_step",
