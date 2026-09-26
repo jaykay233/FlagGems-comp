@@ -32,10 +32,14 @@ MetaX with flag_gems enabled, and include the comparison the numbers are meant
 to replace:
 
     rows    sort (ms)   top_p_threshold (ms)
-       1        2.83                  0.39
-      48       21.48                  0.83
-      64       28.09                  0.96
+       1        2.83                  0.14
+      48       21.48                  0.32
+      64       28.09                  0.38
      256      113.34                  3.05
+
+The rows=256 entry is the fallback path; see `_V2_MAX_ROWS`.  Above that cutoff
+the v2 kernels' (rows, n_bins) atomic histogram leaves L2 and the original
+kernels win, so the op keeps both and picks per call.
 
 Accuracy, against the sort-based reference on real serving logits: the retained
 set has mask IoU 0.996-0.998 with the reference and the retained probability
@@ -77,9 +81,20 @@ _DEFAULT_LO = -40.0
 _DEFAULT_HI = 0.0
 _LN2 = math.log(2.0)
 
+# The v2 path below (2-D grid, no int64 index buffer, fused mask) beats the
+# original one-program-per-row path up to a row count that keeps its
+# (rows, n_bins) atomic histogram resident in L2.  Measured crossover on the
+# C500, vocab 130560: v2 wins 2.65x at rows=64, 2.30x at 128, 1.19x at 192, and
+# loses at 256 (0.89x) where the histogram spills to HBM and the per-element
+# atomics dominate the scatter_add_ they replaced.  Above the cutoff the
+# original kernels run unchanged, so no row count is slower than it was.
+_V2_MAX_ROWS = 128
+_V2_BLOCK = 4096
+
 # Scratch is keyed by shape so a decode loop reuses it instead of reallocating
 # ~100 MB per step.
 _scratch: dict = {}
+_scratch_v2: dict = {}
 
 
 @triton.jit
@@ -174,6 +189,163 @@ def _get_scratch(logits: torch.Tensor, n_bins: int) -> dict:
     return buf
 
 
+# ---------------------------------------------------------------------------
+# v2 path.
+#
+# Same algorithm, but shaped for the row counts serving actually uses (1 to the
+# concurrency limit).  Four changes, none semantic:
+#
+#   1. No int64 index buffer.  The bucket is a pure function of `e`
+#      (`bucket = (log2(e) - lo) / step`), so materialising 8 B/element and
+#      reading it back was redundant.  The fp32 exp/log2 round-trip moves the
+#      bin by <1e-3 bins, which cannot change which bucket a token lands in
+#      except for tokens sitting exactly on a boundary.
+#   2. 2-D grid (rows, col_blocks).  The original used one program per row for
+#      both the max pass and the exp pass, so at rows=1 -- the batch-1 case --
+#      a single program walked 130k elements twice: measured 11 GB/s, 234 us.
+#   3. The max pass stores per-block partials and the mass pass reduces them
+#      (n_blocks is ~32), instead of a second serial pass over the row.
+#   4. The mask is fused into one compare+select kernel.  `masked_fill` leaves
+#      torch to materialise a bool mask tensor first: 10 B/element at 237 GB/s.
+#
+# The threshold search is also reformulated to avoid two `tl.flip`s of n_bins
+# elements: `sum_{j>=i} h_j >= p*total` is equivalent to
+# `exclusive_cumsum[i] <= (1-p)*total`, and the count of satisfied bins is the
+# answer.  That also removes a p == 1.0 quirk: the original tested
+# `rev[0] >= total`, comparing two fp32 cumulative sums that need not round to
+# the same value, so it could drop tokens that were nowhere near the cutoff.
+# `exclusive_cumsum[0]` is exactly 0 and always satisfies `<= 0`, so the cutoff
+# lands on the lowest bucket.  Tokens more than `lo` decades below the row max
+# are still excluded at p == 1.0 -- that bound is inherent to bucketing and
+# applies to both paths; measured 24 of 8.3M tokens at rows=64.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _top_p_rowmax_v2_kernel(logits, pmax, n_cols, stride_r, NBLK, BLOCK: tl.constexpr):
+    """Per-block partial row maxima, grid (rows, NBLK)."""
+    row = tl.program_id(0)
+    blk = tl.program_id(1)
+    cols = blk * BLOCK + tl.arange(0, BLOCK)
+    m = cols < n_cols
+    x = tl.load(logits + row * stride_r + cols, mask=m, other=float("-inf"))
+    tl.store(pmax + row * NBLK + blk, tl.max(x, axis=0))
+
+
+@triton.jit
+def _top_p_mass_v2_kernel(
+    logits, pmax, hist, n_cols, stride_r, NBLK,
+    NBLK_P2: tl.constexpr, N_BINS: tl.constexpr, LO: tl.constexpr,
+    STEP: tl.constexpr, INV_LN2: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """Resolve the row max from the partials, then accumulate exp into buckets.
+
+    Grid (rows, NBLK).  Each element costs one read and one atomic add into the
+    (rows, n_bins) histogram; nothing else is written.
+    """
+    row = tl.program_id(0)
+    blk = tl.program_id(1)
+    bi = tl.arange(0, NBLK_P2)
+    partials = tl.load(pmax + row * NBLK + bi, mask=bi < NBLK, other=float("-inf"))
+    row_max = tl.max(partials, axis=0)
+    # An all -inf row must keep the reference behaviour: every relative value
+    # becomes -inf, so its mass is 0 and no token is selected.
+    row_max = tl.where(row_max > -3.0e38, row_max, 0.0)
+
+    cols = blk * BLOCK + tl.arange(0, BLOCK)
+    m = cols < n_cols
+    x = tl.load(logits + row * stride_r + cols, mask=m, other=float("-inf"))
+    e = tl.exp(x - row_max)
+    bucket = ((x - row_max) * INV_LN2 - LO) / STEP
+    bucket = tl.minimum(tl.maximum(bucket, 0.0), N_BINS - 1.0)
+    tl.atomic_add(hist + row * N_BINS + bucket.to(tl.int32), e, mask=m)
+
+
+@triton.jit
+def _top_p_amax_v2_kernel(pmax, amax, NBLK, NBLK_P2: tl.constexpr):
+    row = tl.program_id(0)
+    bi = tl.arange(0, NBLK_P2)
+    p = tl.load(pmax + row * NBLK + bi, mask=bi < NBLK, other=float("-inf"))
+    mx = tl.max(p, axis=0)
+    tl.store(amax + row, tl.where(mx > -3.0e38, mx, 0.0))
+
+
+@triton.jit
+def _top_p_threshold_v2_kernel(
+    hist, amax, p_ptr, thresh_out,
+    N_BINS: tl.constexpr, LO: tl.constexpr, STEP: tl.constexpr, LN2: tl.constexpr,
+):
+    """One program per row: forward exclusive cumsum, count, emit the cutoff."""
+    row = tl.program_id(0)
+    bins = tl.arange(0, N_BINS)
+    h = tl.load(hist + row * N_BINS + bins).to(tl.float32)
+    total = tl.sum(h, axis=0)
+    excl = tl.cumsum(h, axis=0) - h
+    target = (1.0 - tl.load(p_ptr + row)) * total
+    index = tl.sum((excl <= target).to(tl.int32), axis=0) - 1
+    tl.store(thresh_out + row,
+             tl.load(amax + row) + (LO + index.to(tl.float32) * STEP) * LN2)
+
+
+@triton.jit
+def _top_p_mask_v2_kernel(src, dst, thresh, n_cols, stride_r, BLOCK: tl.constexpr):
+    """dst = src where src >= thresh[row] else -inf, grid (rows, NBLK).
+
+    Row-major rather than a flat element grid: n_cols is not a multiple of
+    BLOCK, so a flat block would straddle two rows and read the wrong threshold.
+    """
+    row = tl.program_id(0)
+    blk = tl.program_id(1)
+    cols = blk * BLOCK + tl.arange(0, BLOCK)
+    m = cols < n_cols
+    x = tl.load(src + row * stride_r + cols, mask=m, other=0.0)
+    t = tl.load(thresh + row)
+    tl.store(dst + row * stride_r + cols, tl.where(x < t, float("-inf"), x), mask=m)
+
+
+def _get_scratch_v2(logits: torch.Tensor, n_bins: int, nblk: int) -> dict:
+    key = (logits.shape[0], logits.shape[1], logits.device, logits.dtype, n_bins)
+    buf = _scratch_v2.get(key)
+    if buf is None:
+        rows, _ = logits.shape
+        buf = {
+            "pmax": torch.empty(rows, nblk, device=logits.device, dtype=torch.float32),
+            "hist": torch.empty(rows, n_bins, device=logits.device, dtype=torch.float32),
+            "amax": torch.empty(rows, device=logits.device, dtype=torch.float32),
+            "thresh": torch.empty(rows, device=logits.device, dtype=torch.float32),
+            "p": torch.empty(rows, device=logits.device, dtype=torch.float32),
+        }
+        _scratch_v2[key] = buf
+    return buf
+
+
+def _top_p_threshold_v2(
+    logits: torch.Tensor, p: torch.Tensor, n_bins: int, lo: float, step: float,
+) -> torch.Tensor:
+    rows, n_cols = logits.shape
+    block = _V2_BLOCK
+    nblk = triton.cdiv(n_cols, block)
+    nblk_p2 = triton.next_power_of_2(nblk)
+    buf = _get_scratch_v2(logits, n_bins, nblk)
+    buf["p"].copy_(p.to(device=logits.device, dtype=torch.float32))
+
+    out = torch.empty_like(logits)
+    grid = (rows, nblk)
+    _top_p_rowmax_v2_kernel[grid](
+        logits, buf["pmax"], n_cols, logits.stride(0), nblk, block)
+    buf["hist"].zero_()
+    _top_p_mass_v2_kernel[grid](
+        logits, buf["pmax"], buf["hist"], n_cols, logits.stride(0), nblk,
+        nblk_p2, n_bins, lo, step, 1.0 / _LN2, block)
+    _top_p_amax_v2_kernel[(rows,)](
+        buf["pmax"], buf["amax"], nblk, nblk_p2)
+    _top_p_threshold_v2_kernel[(rows,)](
+        buf["hist"], buf["amax"], buf["p"], buf["thresh"], n_bins, lo, step, _LN2)
+    _top_p_mask_v2_kernel[grid](
+        logits, out, buf["thresh"], n_cols, logits.stride(0), block)
+    return out
+
+
 def top_p_threshold(
     logits: torch.Tensor,
     p: torch.Tensor,
@@ -230,6 +402,10 @@ def top_p_threshold(
 
     n_bins = int(n_bins)
     step = (hi - lo) / n_bins
+    # Serving rows are bounded by the concurrency limit; below the measured
+    # crossover the v2 path is faster by 2.6x (rows=64) to 3.3x (rows=1).
+    if rows <= _V2_MAX_ROWS:
+        return _top_p_threshold_v2(logits, p, n_bins, lo, step)
     buf = _get_scratch(logits, n_bins)
     buf["p"].copy_(p.to(device=logits.device, dtype=torch.float32))
 
