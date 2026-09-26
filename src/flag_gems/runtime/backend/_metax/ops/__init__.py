@@ -40,6 +40,7 @@ from .matmul_bf16 import matmul_bf16
 from .matmul_int8 import matmul_int8
 from .min import min, min_dim
 from .mm import mm, mm_out
+from .mm_silu_mul import mm_silu_mul, silu_and_mul_gate_up
 from .mvlgamma_ import mvlgamma_
 from .nansum import nansum, nansum_out
 from .new_ones import new_ones
@@ -133,6 +134,8 @@ __all__ = [
     "min_dim",
     "min",
     "mm",
+    "mm_silu_mul",
+    "silu_and_mul_gate_up",
     "mm_out",
     "mvlgamma_",
     "nansum",
