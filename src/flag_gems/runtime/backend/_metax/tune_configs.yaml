@@ -377,6 +377,208 @@ mm_nt:
     scenario: ""
   num_stages: 2
   num_warps: 8
+# Added for the M=2048 prefill chunk, where mcblas used 256x256x64 / 256x192x64 and
+# FlagGems was 1.74x off. The blocker is shared_memory_per_block = 64 KB on the C500:
+# a bf16 tile costs (BM*BK + BK*BN)*2 bytes per stage, so
+#     256x256x64 -> 128 KB  (OOR)      128x256x64 -> 96 KB  (OOR)
+#     256x256x32 ->  64 KB  (fits 2 stages)  128x128x64 -> 64 KB (fits 2 stages)
+# Dropping BLOCK_K to 32 is what makes the mcblas-shaped 256-wide tile expressible
+# at all. Swept against mcblas on the real projection shapes (M=2048, device ms):
+#     shape     native   old best (128x128x32)   128x128x64   256x256x32
+#     qkv        0.144          0.252              0.242        0.189
+#     gate_up    0.535            -                  -          0.716
+#     down       0.290          0.805              0.485        0.495
+#     o_proj     0.114          0.193              0.185        0.188
+#     lm_head    5.232            -                  -          7.023
+# 256x256x32 is best on the three wide shapes and within noise on the other two,
+# while 128x128x64 wins o_proj/down, so both are added and the autotuner picks.
+- META:
+    BLOCK_M: 256
+    BLOCK_N: 256
+    BLOCK_K: 32
+    pipeline: "basic"
+    scenario: ""
+  num_stages: 2
+  num_warps: 8
+- META:
+    BLOCK_M: 128
+    BLOCK_N: 128
+    BLOCK_K: 64
+    pipeline: "basic"
+    scenario: ""
+  num_stages: 2
+  num_warps: 8
+# ---- Decode (small-M) and prefill configs measured on the C500, 2026-09-26 ----
+# Sweep method: same-process interleaved against native mcblas with flag_gems
+# never enabled, launching the raw mm_kernel_nt JITFunction directly, so the
+# native/mine ratio is free of the drift that polluted earlier numbers.
+# Correctness: every config below was checked against a.float() @ w.float().t()
+# and came back at rel_err 1.66e-03, the bf16-with-fp32-accumulation floor.
+#
+# Decode (M=64). The binding constraint at M=64 is *parallelism*, not tile shape:
+# with BLOCK_M=64 the grid is 1 x ceil(N/BLOCK_N), so e.g. o_proj gets 16 blocks
+# on a 104-SM part. BLOCK_M=32 splits M into two tiles and roughly doubles the
+# grid. Ratios below are Triton / mcblas, lower is better:
+#     shape     old best            BLOCK_M=32/BM,BK=128    native
+#     qkv       1.937x (128x64x64)  1.107x (32x64x128)     29.7 us
+#     o_proj    1.927x (128x64x64)  1.112x (32x64x128)     29.0 us
+#     down      2.389x (128x64x64)  1.212x (64x32x128)     53.2 us
+#     gate_up   1.281x (64x128x64)  1.178x (64x128x64)     53.7 us
+#     lm_head   0.784x (64x128x64)  0.729x (64x128x64/st3) 670 us  <- beats mcblas
+# BLOCK_K=128 needs 2 stages to keep the pipeline fed and still fits: the
+# compiler reports 49152 B of shared for these tiles against the 65536 B cap.
+- META:
+    BLOCK_M: 32
+    BLOCK_N: 64
+    BLOCK_K: 128
+    pipeline: "basic"
+    scenario: ""
+  num_stages: 2
+  num_warps: 8
+- META:
+    BLOCK_M: 64
+    BLOCK_N: 32
+    BLOCK_K: 128
+    pipeline: "basic"
+    scenario: ""
+  num_stages: 2
+  num_warps: 8
+- META:
+    BLOCK_M: 64
+    BLOCK_N: 128
+    BLOCK_K: 64
+    pipeline: "basic"
+    scenario: ""
+  num_stages: 2
+  num_warps: 8
+- META:
+    BLOCK_M: 64
+    BLOCK_N: 128
+    BLOCK_K: 64
+    pipeline: "basic"
+    scenario: ""
+  num_stages: 3
+  num_warps: 8
+# Prefill (M=2048) wants scenario="fullstage"; the bare 256x256x32 and
+# 128x128x64 entries above stay so the autotuner can pick per shape.
+#     shape     bare 256x256x32   +fullstage   128x128x64+fullstage   native
+#     qkv           1.324x          1.304x           1.675x            143.6 us
+#     gate_up       1.471x          1.328x           1.609x            534.8 us
+#     lm_head       1.340x          1.331x           1.692x           5231 us
+#     o_proj        1.639x          1.639x           1.615x            113.4 us
+#     down          1.605x          1.691x           1.655x            289.6 us
+- META:
+    BLOCK_M: 256
+    BLOCK_N: 256
+    BLOCK_K: 32
+    pipeline: "basic"
+    scenario: "fullstage"
+  num_stages: 2
+  num_warps: 8
+- META:
+    BLOCK_M: 128
+    BLOCK_N: 128
+    BLOCK_K: 64
+    pipeline: "basic"
+    scenario: "fullstage"
+  num_stages: 2
+  num_warps: 8
+mm_silu_mul:
+# Fused gate/up projection + silu_and_mul. Footprint per stage is
+# (BLOCK_M*BLOCK_K + 2*BLOCK_K*BLOCK_N) * 2 bytes, because each program keeps
+# BOTH the gate and the up B tile resident; the 64KB smem cap therefore admits a
+# narrower tile set than `mm_nt`. Measured on C500 (2026-09-26): the tiles below
+# are the ones that fit, chosen to cover the decode region (small BLOCK_M, where
+# skipping the 2N write/read round-trip is the whole win) through mid-M.
+  - META:
+      BLOCK_M: 32
+      BLOCK_N: 64
+      BLOCK_K: 64
+      pipeline: "basic"
+      scenario: ""
+    num_stages: 3
+    num_warps: 4
+  - META:
+      BLOCK_M: 32
+      BLOCK_N: 128
+      BLOCK_K: 32
+      pipeline: "basic"
+      scenario: ""
+    num_stages: 3
+    num_warps: 4
+  - META:
+      BLOCK_M: 32
+      BLOCK_N: 128
+      BLOCK_K: 32
+      pipeline: "basic"
+      scenario: ""
+    num_stages: 2
+    num_warps: 4
+  - META:
+      BLOCK_M: 64
+      BLOCK_N: 64
+      BLOCK_K: 64
+      pipeline: "basic"
+      scenario: ""
+    num_stages: 2
+    num_warps: 4
+  - META:
+      BLOCK_M: 64
+      BLOCK_N: 64
+      BLOCK_K: 32
+      pipeline: "basic"
+      scenario: ""
+    num_stages: 3
+    num_warps: 4
+  - META:
+      BLOCK_M: 64
+      BLOCK_N: 128
+      BLOCK_K: 32
+      pipeline: "basic"
+      scenario: ""
+    num_stages: 3
+    num_warps: 4
+  - META:
+      BLOCK_M: 64
+      BLOCK_N: 128
+      BLOCK_K: 32
+      pipeline: "basic"
+      scenario: ""
+    num_stages: 3
+    num_warps: 8
+  - META:
+      BLOCK_M: 128
+      BLOCK_N: 64
+      BLOCK_K: 32
+      pipeline: "basic"
+      scenario: ""
+    num_stages: 2
+    num_warps: 4
+  - META:
+      BLOCK_M: 128
+      BLOCK_N: 64
+      BLOCK_K: 32
+      pipeline: "basic"
+      scenario: ""
+    num_stages: 2
+    num_warps: 8
+  - META:
+      BLOCK_M: 128
+      BLOCK_N: 32
+      BLOCK_K: 64
+      pipeline: "basic"
+      scenario: ""
+    num_stages: 2
+    num_warps: 4
+  - META:
+      BLOCK_M: 256
+      BLOCK_N: 64
+      BLOCK_K: 32
+      pipeline: "basic"
+      scenario: ""
+    num_stages: 2
+    num_warps: 8
+
 mm_splitk:
 - META:
     BLOCK_M: 16

@@ -125,7 +125,16 @@ def _prune_mm_dense_configs(configs, named_args, transposed_b=False, **kwargs):
         stages = config.num_stages
 
         if block_k == 128:
-            if block_m > 128 or block_n > 128 or pipeline != "cpasync":
+            # Measured on the C500 (2026-09-26): BLOCK_K=128 under the *basic*
+            # pipeline is the fastest decode shape. 32x64x128 and 64x32x128
+            # reach 1.11x / 1.21x of mcblas where the previous best 128x64x64
+            # entries sat at 1.94x / 2.39x. The old rule allowed BLOCK_K=128
+            # only with cpasync, which excluded exactly those tiles. cpasync was
+            # measured to be uniformly *worse* (1.6x-2.9x across all shapes), so
+            # gate on the shared-memory footprint instead of on the pipeline.
+            if block_m > 128 or block_n > 128:
+                continue
+            if pipeline != "cpasync" and (block_m + block_n) * block_k * 2 > 64 * 1024:
                 continue
 
         if (
@@ -143,13 +152,33 @@ def _prune_mm_dense_configs(configs, named_args, transposed_b=False, **kwargs):
             if stage_bytes > 64 * 1024:
                 continue
 
-        if M >= 1024 and N >= 128:
+        if M >= 128 and N >= 128:
+            # Prefill-shaped: tile-bound, so the large tiles are the ones that
+            # win. Measured (2026-09-26) on C500 with `gate_up` (N=12288, K=2048),
+            # an oracle sweep over every `mm_nt` config gives
+            #   M=128 -> 128x128x64/st2/w8/fs   1.17x of the generic kernel
+            #   M=256 -> 128x128x64/st2/w8/fs   1.07x
+            #   M=512 -> 256x256x32/st2/w8      1.32x
+            # and in every case the winner is a large tile that the decode rules
+            # below would reject. This threshold used to be M >= 1024, which ran
+            # the decode rules over 128..1023 as well; there the surviving
+            # configs were 0.80x-0.95x, i.e. *slower* than the generic kernel
+            # (see the M=512 row: 317us vs 254us generic, 192us achievable).
             if block_m not in (64, 128, 256) or block_n not in (64, 128, 256):
                 continue
             if warps not in (4, 8):
                 continue
         else:
-            if block_m == 128 or warps == 8:
+            # Decode (M < 1024) is parallelism-bound, not tile-bound: with
+            # BLOCK_M=64 the grid collapses to 1 x ceil(N/BLOCK_N), so o_proj
+            # gets 16 blocks on a 104-SM part and the SMs idle. BLOCK_M=32
+            # splits M into two tiles and roughly doubles the grid, which is
+            # where the decode speedups come from. Those tiles carry
+            # BLOCK_K=128 and therefore want 8 warps, so the blanket
+            # "warps == 8" rejection had to be narrowed rather than kept.
+            if block_m == 128:
+                continue
+            if warps == 8 and not (block_m <= 64 and block_n <= 128):
                 continue
             if N <= 64 and (block_m > 64 or block_n > 64):
                 continue
@@ -1245,6 +1274,51 @@ def _select_two_step_split_k(M, N, K):
     return None
 
 
+# The dispatch predicates below are pure functions of (M, N, K, strides,
+# dtypes): no data dependence, and the device constants they consult
+# (get_sm_count / get_l2_cache_size) are stable for the process lifetime. So the
+# selected branch can be memoised per shape.
+#
+# This matters because ``linear`` now routes every M > 1 projection through this
+# module (see ``_metax/ops/linear.py``), so a decode or prefill step runs ~169 of
+# these calls. Re-running the predicates each time cost ~27 us/call on top of the
+# ~70 us tuner+heuristics+launch floor; the cache removes it entirely.
+_MM_ROUTE_CACHE: dict = {}
+_MM_ROUTE_CACHE_MAX = 512
+
+
+def _mm_route_key(a, b, M, N, K):
+    return (
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        a.dtype,
+        b.dtype,
+    )
+
+
+def _decide_mm_route(a, b, c, M, N, K):
+    """Evaluate the dispatch predicates once and return ``(kind, payload)``."""
+    if N == 1:
+        if _gemv_k_parallel_scenario(M, K):
+            return ("gemv_k_parallel", None)
+        return ("gemv_mm", None)
+    two_step_split_k = _select_two_step_split_k(M, N, K)
+    if two_step_split_k is not None:
+        return ("two_step", two_step_split_k)
+    if splitk_mm_scenario(M, N, K):
+        return ("splitk", None)
+    if nn_mm_scenario(a, b, c, M, N, K):
+        return ("nn", None)
+    if nt_mm_scenario(a, b, c, M, N, K):
+        return ("nt", None)
+    return ("general", None)
+
+
 def mm(a, b):
     logger.debug("GEMS_METAX MM")
     device = a.device
@@ -1260,22 +1334,35 @@ def mm(a, b):
     # allocates output
     c_dtype = get_higher_dtype(a.dtype, b.dtype)
     c = torch.empty((M, N), device=device, dtype=c_dtype)
+
+    # M == 1 is decided per call: _m1_gemv early-returns None for M != 1, so the
+    # check is a handful of comparisons, and its own guards are layout-dependent
+    # in ways the route key does not capture.
     gemv_out = _m1_gemv(a, b, c, M, N, K)
     if gemv_out is not None:
         return gemv_out
-    if N == 1:
-        if _gemv_k_parallel_scenario(M, K):
-            return gemv_mm_k_parallel(a, b, c, M, K)
+
+    route_key = _mm_route_key(a, b, M, N, K)
+    route = _MM_ROUTE_CACHE.get(route_key)
+    if route is None:
+        route = _decide_mm_route(a, b, c, M, N, K)
+        if len(_MM_ROUTE_CACHE) >= _MM_ROUTE_CACHE_MAX:
+            _MM_ROUTE_CACHE.clear()
+        _MM_ROUTE_CACHE[route_key] = route
+
+    kind, payload = route
+    if kind == "gemv_k_parallel":
+        return gemv_mm_k_parallel(a, b, c, M, K)
+    if kind == "gemv_mm":
         return gemv_mm(a, b, c, M, K)
-    two_step_split_k = _select_two_step_split_k(M, N, K)
-    if two_step_split_k is not None:
-        return splitk_mm_two_step(a, b, c, M, N, K, two_step_split_k)
-    if splitk_mm_scenario(M, N, K):
+    if kind == "two_step":
+        return splitk_mm_two_step(a, b, c, M, N, K, payload)
+    if kind == "splitk":
         c.zero_()
         return splitk_mm(a, b, c, M, N, K)
-    if nn_mm_scenario(a, b, c, M, N, K):
+    if kind == "nn":
         return general_mm_nn(a, b, c, M, N, K)
-    if nt_mm_scenario(a, b, c, M, N, K):
+    if kind == "nt":
         return general_mm_nt(a, b, c, M, N, K)
     return general_mm(a, b, c, M, N, K)
 

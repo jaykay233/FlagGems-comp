@@ -93,6 +93,60 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # only pays a global lookup.
 _ENABLE_GEMV = os.environ.get("FLAG_GEMS_METAX_GEMV", "1") != "0"
 
+# Route M > 1 through the MetaX ``mm`` instead of the generic ``linear_kernel``.
+#
+# Device time on the MiniCPM5-2B projection shapes (169 GEMMs per step, bf16):
+#     M=64   linear_kernel  9.71 ms   vs  mm_kernel_nt  7.24 ms   (1.34x)
+#     M=2048 linear_kernel 99.58 ms   vs  mm_kernel_nt 71.01 ms   (1.40x)
+# The generic kernel has no MetaX-specific tuned config (tune_configs.yaml has no
+# ``linear:`` section), so it cannot adapt its tile to M the way mcblas does.
+#
+# But the win is device-side only, and ``flag_gems.mm`` costs ~110 us/call on the
+# host against ~50 us for ``linear_kernel``. Measured eager, per 169-GEMM step:
+#     M=64    route ON 18.31 ms  vs OFF 10.56 ms   -> route LOSES (host-bound)
+#     M=2048  route ON 71.01 ms  vs OFF 99.58 ms   -> route WINS  (device-bound)
+# so the route must be gated, not applied unconditionally.
+_ENABLE_MM_ROUTE = os.environ.get("FLAG_GEMS_METAX_LINEAR_MM", "1") != "0"
+
+# Device work (M*N*K) below which the eager route cannot amortise its host cost.
+#
+# This used to default to 8e9, on the pre-2026-09-26  measurement that
+# "M=2048 wins, M<=1024 loses". That measurement was taken with an over-eager
+# config pruner which was dropping the large tiles that win in the 128..1023
+# range, so the route looked unprofitable there when in fact the *kernels* were
+# mis-selected. After relaxing that pruner (see _prune_mm_dense_configs in mm.py)
+# an eager A/B over 51 (shape, M) points - M from 8 to 2048, including the
+# smallest realistic shapes - gives `mm` faster in **51/51**, by 1.06x to 1.96x.
+# The smallest point measured is M=8, N=768, K=768 (work 4.7e6), where mm is
+# still 1.31x faster, so there is no evidence for a floor at all.
+#
+# Default is therefore 0: route every batched bias-free 2-D projection through
+# mm. Set FLAG_GEMS_METAX_MM_MIN_WORK to reintroduce a floor if a workload ever
+# shows otherwise.
+_MM_ROUTE_MIN_WORK = int(os.environ.get("FLAG_GEMS_METAX_MM_MIN_WORK", "0"))
+
+try:
+    _is_capturing = torch.cuda.is_current_stream_capturing
+except AttributeError:  # pragma: no cover - older torch without the query
+    _is_capturing = None
+
+
+def _mm_route_worthwhile(M, N, K):
+    """Should this (M, N, K) take the ``mm`` route?
+
+    Under CUDA graph capture the host cost is paid once and replayed for free, so
+    the mm kernels' device advantage applies at any M - and that is exactly the
+    decode case, where M is a small batch. Outside capture (eager prefill) the
+    route only pays off once the device work dwarfs the host overhead.
+    """
+    if _is_capturing is not None:
+        try:
+            if _is_capturing():
+                return True
+        except Exception:  # noqa: BLE001 - never let the probe break a GEMM
+            pass
+    return M * N * K >= _MM_ROUTE_MIN_WORK
+
 # Reachability probe: when set, records every distinct (M, N, K) that reaches
 # this override, so it is visible which callers actually route through
 # FlagGems' `linear` at all. Inert otherwise.
@@ -211,4 +265,27 @@ def linear(input, weight, bias=None):
     if weight.dim() == 2 and input.dim() in (1, 2):
         _M = 1 if input.dim() == 1 else input.shape[0]
         _trace(input.dim(), _M, weight.shape[0], weight.shape[1], "generic")
+
+    # Batched (M > 1) bias-free projections: the MetaX ``mm`` kernels are
+    # measurably better than the generic ``linear_kernel`` (see _ENABLE_MM_ROUTE).
+    # ``mm(x, w.t())`` is exactly ``linear(x, w)`` when bias is None, and w.t()
+    # is the transposed view the ``mm_kernel_nt`` variant wants. Bias is left to
+    # the generic kernel so we do not introduce an extra elementwise pass.
+    if (
+        _ENABLE_MM_ROUTE
+        and bias is None
+        and weight.dim() == 2
+        and input.dim() == 2
+        and input.shape[0] > 1
+        and input.dtype in _SUPPORTED_DTYPES
+        and weight.dtype in _SUPPORTED_DTYPES
+        and input.stride(-1) == 1
+        and weight.stride(-1) == 1
+        and _mm_route_worthwhile(input.shape[0], weight.shape[0], weight.shape[1])
+    ):
+        import flag_gems
+
+        _trace(input.dim(), input.shape[0], weight.shape[0], weight.shape[1], "mm")
+        return flag_gems.mm(input, weight.t())
+
     return _generic_linear(input, weight, bias)
