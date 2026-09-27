@@ -19,6 +19,11 @@ import triton
 import triton.language as tl
 
 from flag_gems import runtime
+
+# Registers the "align32_geometric" key strategy (import side effect).
+from flag_gems.runtime.backend._iluvatar.tuner_strategies import (  # noqa: F401
+    align32_geometric,
+)
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, libtuner
 
@@ -29,7 +34,9 @@ logger = logging.getLogger(__name__)
 @libtuner(
     configs=runtime.get_tuned_config("linear"),
     key=["M", "N", "K"],
-    strategy=["align32", "align32", "align32"],
+    # Same reasoning as mm.py: M is data-dependent, so bound the key space
+    # (align32 alone is unbounded -> 69 buckets over 1..2048).
+    strategy=["align32_geometric", "align32", "align32"],
     warmup=5,
     rep=10,
 )

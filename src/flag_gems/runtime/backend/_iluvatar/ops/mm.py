@@ -21,6 +21,11 @@ import triton.language as tl
 from triton.ops.matmul_perf_model import early_config_prune, estimate_matmul_time
 
 from flag_gems import runtime
+
+# Registers the "align32_geometric" key strategy (import side effect).
+from flag_gems.runtime.backend._iluvatar.tuner_strategies import (  # noqa: F401
+    align32_geometric,
+)
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as tle
@@ -51,6 +56,12 @@ def _to_tl_type(ty):
 @libtuner(
     configs=runtime.get_tuned_config("mm"),
     key=["M", "N", "K"],
+    # M is data-dependent (chunked prefill feeds arbitrary token counts), so an
+    # identity key never warms up: 134 distinct M values were observed in one
+    # cache table.  "align32_geometric" folds M into 13 bounded buckets while
+    # keeping 32-granularity across the decode region.  N and K are static model
+    # dimensions, where plain "align32" is already correct.
+    strategy=["align32_geometric", "align32", "align32"],
     prune_configs_by={
         "early_config_prune": early_config_prune,
         "perf_model": estimate_matmul_time,
