@@ -14,9 +14,11 @@
 
 from .flash_attn_prefill import flash_attn_prefill
 from .ixformer_unified_attention import (
+    clear_batch_split,
     get_dispatch_stats,
     ixformer_unified_attention,
     reset_dispatch_stats,
+    set_batch_split,
     try_ixformer_unified_attention,
 )
 from .matmul_bias_activation import matmul_bias_activation
@@ -25,8 +27,10 @@ from .sparse_attention import sparse_attn_triton
 from .top_k_per_row_prefill import top_k_per_row_prefill
 
 __all__ = [
+    "clear_batch_split",
     "flash_attn_prefill",
     "get_dispatch_stats",
+    "set_batch_split",
     "ixformer_unified_attention",
     "try_ixformer_unified_attention",
     "reset_dispatch_stats",

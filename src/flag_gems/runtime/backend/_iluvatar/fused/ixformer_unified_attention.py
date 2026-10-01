@@ -21,10 +21,12 @@ fall back to Triton ``unified_attention`` (unsupported feature / layout).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import torch
 
+from .flash_attn_prefill import flash_attn_prefill
 from .paged_attention_decode import paged_attention_decode
 
 logger = logging.getLogger(__name__)
@@ -32,9 +34,162 @@ logger = logging.getLogger(__name__)
 # Dispatch counters, readable via ``get_dispatch_stats()``.  "layout" counts
 # calls rejected because the KV cache is not physically HND, which is the one
 # rejection reason that a deployment can fix (VLLM_KV_CACHE_LAYOUT=HND).
-_STATS = {"decode": 0, "prefill": 0, "unsupported": 0, "layout": 0}
+# "mixed_skip" / "short_skip" are prefill-shaped calls left on Triton.
+_STATS = {
+    "decode": 0,
+    "prefill": 0,
+    "split": 0,
+    "mixed_skip": 0,
+    "short_skip": 0,
+    "decode_unsafe_skip": 0,
+    "split_unsafe_skip": 0,
+    "unsupported": 0,
+    "layout": 0,
+}
 _HIT_LOG_EVERY = 64
-_logged_first = {"hit": False, "layout": False, "unsupported": False}
+_logged_first = {
+    "hit": False,
+    "layout": False,
+    "unsupported": False,
+    "mixed_skip": False,
+    "short_skip": False,
+    "decode_unsafe_skip": False,
+    "split": False,
+    "split_unsafe_skip": False,
+}
+
+
+def _split_enabled() -> bool:
+    return os.getenv("VLLM_FL_ILUVATAR_IXFORMER_SPLIT", "1") != "0"
+
+# Below 32 sequences with a KV length of at least 2048, ixformer's
+# paged_attention_flashinfer reads sequence 0's KV for every row and collapses
+# the GQA head mapping; see FINDINGS §17.9.  It is not a precision issue, and
+# with peaked attention the error reaches O(1).
+#
+# Evaluating the KV length here is what keeps the guard cheap.  This function
+# runs when the kernel's launch configuration is chosen -- during CUDA graph
+# capture, or during an eager call; replays never reach Python.  vLLM captures
+# with seq_lens filled to 1, so capture takes the short-context (correct) path
+# and bakes it in, and replaying that graph at a real context length stays
+# correct (verified in flashinfer_cudagraph_check.txt).  Gating on batch size
+# alone would therefore push low-concurrency decode onto Triton for nothing.
+# Should vLLM ever capture with real sequence lengths, this still holds: the
+# capture call would see the long KV and be refused.
+_DECODE_MIN_BATCH = 32
+_DECODE_UNSAFE_CTX = 2048
+
+
+def _decode_is_unsafe(batch: int, max_seqlen_k: int) -> bool:
+    """Both arguments are host-side already, so this costs no sync."""
+    return batch < _DECODE_MIN_BATCH and max_seqlen_k >= _DECODE_UNSAFE_CTX
+
+
+# Where the decode rows end in a reordered batch.  ``unified_attention`` only
+# receives tensors, so the split has to come from the attention metadata
+# builder, which computes it on the host from ``query_start_loc_cpu``.  The
+# plugin calls ``set_batch_split`` once per step; the 42 layers of that step
+# then read it.  Nothing here syncs.
+_BATCH_SPLIT: dict[str, int] = {
+    "num_decodes": -1,
+    "num_decode_tokens": -1,
+    "num_q_tokens": -1,
+}
+
+
+def set_batch_split(
+    num_decodes: int, num_decode_tokens: int, num_q_tokens: int
+) -> None:
+    """Publish the decode/prefill boundary of the current step's batch.
+
+    ``num_q_tokens`` is carried so the consumer can verify the stash belongs to
+    the batch it was handed, rather than to some other KV cache group.
+    """
+    _BATCH_SPLIT["num_decodes"] = int(num_decodes)
+    _BATCH_SPLIT["num_decode_tokens"] = int(num_decode_tokens)
+    _BATCH_SPLIT["num_q_tokens"] = int(num_q_tokens)
+
+
+def clear_batch_split() -> None:
+    _BATCH_SPLIT["num_decodes"] = -1
+    _BATCH_SPLIT["num_decode_tokens"] = -1
+    _BATCH_SPLIT["num_q_tokens"] = -1
+
+
+def _usable_batch_split(num_q_tokens: int, batch: int) -> Optional[tuple[int, int]]:
+    """``(num_decodes, num_decode_tokens)`` when the stash matches this call.
+
+    Returns ``None`` unless the batch really is mixed and reordered: a split is
+    only usable when there is at least one decode row and at least one prefill
+    row, and when the token count proves the stash describes this batch.
+    """
+    n_dec = _BATCH_SPLIT["num_decodes"]
+    n_dec_tok = _BATCH_SPLIT["num_decode_tokens"]
+    if _BATCH_SPLIT["num_q_tokens"] != num_q_tokens:
+        return None
+    if n_dec <= 0 or n_dec >= batch:
+        return None
+    # With reorder_batch_threshold == 1 every decode row contributes one token;
+    # anything else means the batch was reordered under different rules.
+    if n_dec_tok != n_dec:
+        return None
+    return n_dec, n_dec_tok
+
+# Pure-prefill FA only when every sequence's q_len is at least this.
+# FA beats Triton on pure chunks down to q=256 (serve_shape_fa_vs_triton.txt),
+# so this is not really a quality threshold any more: it is what lets a mixed
+# batch be rejected from host-side shapes alone, without a sync.  Values below
+# 2 would force the exact check on every call.
+# Override with VLLM_FL_ILUVATAR_IXFORMER_PREFILL_MIN_Q.
+_DEFAULT_PREFILL_MIN_Q = 256
+
+
+def _prefill_min_q() -> int:
+    raw = os.getenv("VLLM_FL_ILUVATAR_IXFORMER_PREFILL_MIN_Q")
+    if raw is None:
+        return _DEFAULT_PREFILL_MIN_Q
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_PREFILL_MIN_Q
+
+
+def _q_lens_from_cu(cu_seqlens_q: torch.Tensor) -> torch.Tensor:
+    return cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+
+
+def _classify_prefill_batch(
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    num_q_tokens: int,
+    min_q: int,
+) -> str:
+    """Return ``prefill``, ``mixed``, or ``short`` for max_seqlen_q > 1.
+
+    Only the last check reads ``cu_seqlens_q`` on the host, which costs a
+    device->host sync.  Paying that on every mixed step is what the official
+    4k serve feels as higher TTFT, so the cheap shape-only tests reject the
+    common decode+prefill batches first; ``mixed`` vs ``short`` there is a
+    label for diagnostics, both fall back to Triton either way.
+    """
+    batch = int(cu_seqlens_q.numel()) - 1
+    if batch <= 0:
+        return "short"
+    if min_q > 0:
+        if int(max_seqlen_q) < min_q:
+            return "short"
+        # All q_len >= min_q implies num_q_tokens >= batch * min_q, so a batch
+        # failing this cannot be an all-long pure prefill.
+        if num_q_tokens < batch * min_q:
+            return "mixed"
+
+    q_lens = _q_lens_from_cu(cu_seqlens_q)
+    min_len = int(q_lens.min().item())
+    if min_len == 1:
+        return "mixed"
+    if min_q > 0 and min_len < min_q:
+        return "short"
+    return "prefill"
 
 
 def get_dispatch_stats() -> dict:
@@ -63,6 +218,8 @@ def _hnd_view_is_free(cache: torch.Tensor) -> bool:
 def _log_dispatch(kind: str, q: torch.Tensor, k: torch.Tensor, reason: str = "") -> None:
     total = sum(_STATS.values())
     first_key = "hit" if kind in ("decode", "prefill") else kind
+    if first_key not in _logged_first:
+        _logged_first[first_key] = False
     is_first = not _logged_first[first_key]
     periodic = kind in ("decode", "prefill") and _STATS[kind] % _HIT_LOG_EVERY == 0
     if not (is_first or periodic):
@@ -231,25 +388,106 @@ def try_ixformer_unified_attention(
         _log_dispatch("layout", q, k, reason="hnd_view_not_contiguous")
         return False
 
-    # Pure decode only.  Prefill / mixed (max_seqlen_q > 1) stays on the
-    # Triton tile64 path: ixformer paged FA wins on full-seq microbenches but
-    # loses badly under vLLM chunked-prefill shapes in the official 4k serve.
-    if int(max_seqlen_q) != 1:
-        _STATS["prefill"] += 1  # counted as "seen but skipped"
-        _log_dispatch("prefill", q, k, reason="decode_only_skip")
+    # Decode: every sequence has q_len == 1.
+    if int(max_seqlen_q) == 1:
+        if _decode_is_unsafe(int(block_table.shape[0]), int(max_seqlen_k)):
+            _STATS["decode_unsafe_skip"] += 1
+            _log_dispatch(
+                "decode_unsafe_skip", q, k, reason="flashinfer_small_batch_long_ctx"
+            )
+            return False
+        _STATS["decode"] += 1
+        _log_dispatch("decode", q, k)
+        paged_attention_decode(
+            out=out,
+            query=q,
+            key_cache=k,
+            value_cache=v,
+            block_table=block_table,
+            seqused_k=seqused_k,
+            softmax_scale=softmax_scale,
+            max_seqlen_k=max_seqlen_k,
+        )
+        return True
+
+    # Mixed batch: if vLLM reordered it, the decode rows form a contiguous
+    # prefix and the two halves can go to the kernel each is good at.  FA costs
+    # ~0.21 ms per sequence on a mixed batch because every decode row pays a
+    # full q-tile sweep, so leaving them together is what made all-FA lose.
+    batch = int(block_table.shape[0])
+    num_q_tokens = int(q.shape[0])
+    split = _usable_batch_split(num_q_tokens, batch)
+    if split is not None and _split_enabled():
+        n_dec, n_dec_tok = split
+        if _decode_is_unsafe(n_dec, int(max_seqlen_k)):
+            # Mixed batches run eager, so unlike pure decode they get no
+            # shelter from graph capture.  The decode slice is also smaller
+            # than the whole batch, so it can fall into the flashinfer corner
+            # even when the batch does not.
+            _STATS["split_unsafe_skip"] += 1
+            _log_dispatch(
+                "split_unsafe_skip", q, k, reason="decode_slice_below_min_batch"
+            )
+            return False
+        _STATS["split"] += 1
+        _log_dispatch("split", q, k, reason=f"decode={n_dec} prefill={batch - n_dec}")
+        paged_attention_decode(
+            out=out[:n_dec_tok],
+            query=q[:n_dec_tok],
+            key_cache=k,
+            value_cache=v,
+            block_table=block_table[:n_dec],
+            seqused_k=seqused_k[:n_dec],
+            softmax_scale=softmax_scale,
+            max_seqlen_k=max_seqlen_k,
+        )
+        flash_attn_prefill(
+            out=out[n_dec_tok:],
+            query=q[n_dec_tok:],
+            key_cache=k,
+            value_cache=v,
+            cu_seqlens_q=cu_seqlens_q[n_dec:] - cu_seqlens_q[n_dec],
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k[n_dec:],
+            max_seqlen_k=max_seqlen_k,
+            block_table=block_table[n_dec:],
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+        )
+        return True
+
+    # Not reordered (or not mixed): mixed or short chunks stay on Triton
+    # tile64; only large pure-prefill batches take ixformer FA (§17.6).
+    kind = _classify_prefill_batch(
+        cu_seqlens_q, max_seqlen_q, num_q_tokens, _prefill_min_q()
+    )
+    if kind == "mixed":
+        _STATS["mixed_skip"] += 1
+        _log_dispatch("mixed_skip", q, k, reason="mixed_batch_fallback_triton")
+        return False
+    if kind == "short":
+        _STATS["short_skip"] += 1
+        _log_dispatch("short_skip", q, k, reason="short_chunk_fallback_triton")
         return False
 
-    _STATS["decode"] += 1
-    _log_dispatch("decode", q, k)
-    paged_attention_decode(
+    _STATS["prefill"] += 1
+    _log_dispatch("prefill", q, k, reason="large_pure_prefill_fa")
+    flash_attn_prefill(
         out=out,
         query=q,
         key_cache=k,
         value_cache=v,
-        block_table=block_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
         seqused_k=seqused_k,
-        softmax_scale=softmax_scale,
         max_seqlen_k=max_seqlen_k,
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size if window_size is not None else (-1, -1),
+        softcap=float(softcap or 0.0),
     )
     return True
 

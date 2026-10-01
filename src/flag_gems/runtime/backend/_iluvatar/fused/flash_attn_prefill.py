@@ -34,10 +34,11 @@ def _bndh_to_bhnd(cache: torch.Tensor) -> torch.Tensor:
 
 
 def _cu_seqlens_from_seqused(seqused: torch.Tensor) -> torch.Tensor:
-    cu = torch.empty(
+    # zeros() rather than empty() + ``cu[0] = 0``: assigning a Python scalar
+    # into a CUDA tensor synchronizes, once per layer per step.
+    cu = torch.zeros(
         seqused.shape[0] + 1, dtype=torch.int32, device=seqused.device
     )
-    cu[0] = 0
     torch.cumsum(seqused.to(torch.int32), dim=0, out=cu[1:])
     return cu
 
