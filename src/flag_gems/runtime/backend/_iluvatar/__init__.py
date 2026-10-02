@@ -35,6 +35,9 @@ vendor_info = VendorDescriptor(
     fp64_enabled=False,
 )
 
-CUSTOMIZED_UNUSED_OPS = ()
+# FlagGems' Triton ``add`` costs ~0.34 ms of host per call on BI-V150 while the
+# GPU kernel is ~0.06 ms; eager prefill steps issue ~89 adds (~30 ms host).
+# Native aten::add launches in ~0.01 ms.
+CUSTOMIZED_UNUSED_OPS = ("add",)
 
 __all__ = ["*"]
