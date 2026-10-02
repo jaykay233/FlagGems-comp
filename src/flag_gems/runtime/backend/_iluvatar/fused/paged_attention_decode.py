@@ -83,6 +83,7 @@ def paged_attention_decode(
     seqused_k: torch.Tensor,
     softmax_scale: float,
     max_seqlen_k: int = -1,
+    pages: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Run ixformer decode attention for a pure decode batch.
 
@@ -94,6 +95,9 @@ def paged_attention_decode(
         seqused_k: ``[batch]`` KV lengths.
         softmax_scale: attention scale.
         max_seqlen_k: optional hint; derived from ``seqused_k`` when ``<= 0``.
+        pages: optional prebuilt ``(indptr, indices, last_page_len)``.  Pass the
+            once-per-step stash from ``prebuild_split_meta`` to skip rebuilding
+            the FlagGems pointwise chain on every layer.
     """
     from ixformer.inference.functions.paged_attention import (
         paged_attention_flashinfer,
@@ -107,9 +111,12 @@ def paged_attention_decode(
 
     k_hnd = _bndh_to_hnd(key_cache)
     v_hnd = _bndh_to_hnd(value_cache)
-    indptr, indices, last_page_len = _build_flashinfer_pages(
-        block_table, seqused_k, page_size
-    )
+    if pages is None:
+        indptr, indices, last_page_len = _build_flashinfer_pages(
+            block_table, seqused_k, page_size
+        )
+    else:
+        indptr, indices, last_page_len = pages
     paged_attention_flashinfer(
         out,
         query,

@@ -57,6 +57,7 @@ def flash_attn_prefill(
     causal: bool = True,
     window_size: tuple[int, int] = (-1, -1),
     softcap: float = 0.0,
+    cu_seqlens_k: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run ixformer paged flash-attn for prefill / mixed batches.
 
@@ -64,8 +65,10 @@ def flash_attn_prefill(
         out / query: ``[total_q_tokens, num_heads, head_dim]``.
         key_cache / value_cache: BNDH paged KV.
         cu_seqlens_q: ``[batch + 1]`` query prefix sums.
-        seqused_k: ``[batch]`` KV lengths (used to build ``cu_seqlens_k``).
+        seqused_k: ``[batch]`` KV lengths (used to build ``cu_seqlens_k`` when
+            ``cu_seqlens_k`` is not supplied).
         block_table: ``[batch, max_blocks]``.
+        cu_seqlens_k: optional once-per-step stash; skips the zeros+cumsum chain.
     """
     from ixformer.contrib.vllm_flash_attn.flash_attn_interface import (
         flash_attn_varlen_func,
@@ -78,7 +81,8 @@ def flash_attn_prefill(
 
     k_bhnd = _bndh_to_bhnd(key_cache)
     v_bhnd = _bndh_to_bhnd(value_cache)
-    cu_seqlens_k = _cu_seqlens_from_seqused(seqused_k)
+    if cu_seqlens_k is None:
+        cu_seqlens_k = _cu_seqlens_from_seqused(seqused_k)
 
     flash_attn_varlen_func(
         query,

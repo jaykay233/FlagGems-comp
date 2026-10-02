@@ -88,32 +88,111 @@ def _decode_is_unsafe(batch: int, max_seqlen_k: int) -> bool:
 # Where the decode rows end in a reordered batch.  ``unified_attention`` only
 # receives tensors, so the split has to come from the attention metadata
 # builder, which computes it on the host from ``query_start_loc_cpu``.  The
-# plugin calls ``set_batch_split`` once per step; the 42 layers of that step
-# then read it.  Nothing here syncs.
-_BATCH_SPLIT: dict[str, int] = {
+# plugin calls ``set_batch_split`` / ``prebuild_split_meta`` once per step; the
+# 42 layers of that step then read it.  Nothing here syncs.
+#
+# Optional prebuilt tensors (flashinfer pages, FA cu_seqlens) are also stashed
+# here.  Under FlagGems those ~20 pointwise ops cost ~6 ms of host time each
+# when rebuilt per layer; building them once in the metadata builder drops the
+# mixed-step host cost by ~40× (§17.10).
+_BATCH_SPLIT: dict = {
     "num_decodes": -1,
     "num_decode_tokens": -1,
     "num_q_tokens": -1,
+    "decode_pages": None,  # (indptr, indices, last_page_len) or None
+    "decode_n": -1,  # sequences covered by decode_pages
+    "prefill_cu_k": None,
+    "prefill_cu_q": None,
 }
 
 
 def set_batch_split(
-    num_decodes: int, num_decode_tokens: int, num_q_tokens: int
+    num_decodes: int,
+    num_decode_tokens: int,
+    num_q_tokens: int,
+    decode_pages: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    prefill_cu_k: Optional[torch.Tensor] = None,
+    prefill_cu_q: Optional[torch.Tensor] = None,
 ) -> None:
     """Publish the decode/prefill boundary of the current step's batch.
 
     ``num_q_tokens`` is carried so the consumer can verify the stash belongs to
     the batch it was handed, rather than to some other KV cache group.
+    Optional ``decode_pages`` / ``prefill_cu_*`` are the once-per-step metadata
+    kernels; omit them and every layer rebuilds (the old behaviour).
     """
     _BATCH_SPLIT["num_decodes"] = int(num_decodes)
     _BATCH_SPLIT["num_decode_tokens"] = int(num_decode_tokens)
     _BATCH_SPLIT["num_q_tokens"] = int(num_q_tokens)
+    _BATCH_SPLIT["decode_pages"] = decode_pages
+    _BATCH_SPLIT["decode_n"] = (
+        int(num_decodes) if decode_pages is not None else -1
+    )
+    _BATCH_SPLIT["prefill_cu_k"] = prefill_cu_k
+    _BATCH_SPLIT["prefill_cu_q"] = prefill_cu_q
 
 
 def clear_batch_split() -> None:
     _BATCH_SPLIT["num_decodes"] = -1
     _BATCH_SPLIT["num_decode_tokens"] = -1
     _BATCH_SPLIT["num_q_tokens"] = -1
+    _BATCH_SPLIT["decode_pages"] = None
+    _BATCH_SPLIT["decode_n"] = -1
+    _BATCH_SPLIT["prefill_cu_k"] = None
+    _BATCH_SPLIT["prefill_cu_q"] = None
+
+
+def prebuild_split_meta(
+    num_decodes: int,
+    num_decode_tokens: int,
+    num_q_tokens: int,
+    block_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Build flashinfer/FA metadata once and publish it with the split.
+
+    Called from the attention-metadata builder (once per step).  Covers both
+    the mixed-batch split and a pure-decode batch (``num_decodes == batch``),
+    so eager decode layers also reuse the pages.
+    """
+    from .flash_attn_prefill import _cu_seqlens_from_seqused
+    from .paged_attention_decode import _build_flashinfer_pages
+
+    n_dec = int(num_decodes)
+    n_dec_tok = int(num_decode_tokens)
+    batch = int(block_table.shape[0])
+    decode_pages = None
+    prefill_cu_k = None
+    prefill_cu_q = None
+    # threshold-1 reorder: one token per decode row.
+    if n_dec > 0 and n_dec_tok == n_dec and n_dec <= batch:
+        decode_pages = _build_flashinfer_pages(
+            block_table[:n_dec], seqused_k[:n_dec], page_size
+        )
+        if n_dec < batch:
+            prefill_cu_k = _cu_seqlens_from_seqused(seqused_k[n_dec:])
+            # Stay on-device: cu_seqlens_q[n_dec] is a 0-d tensor, not a Python int.
+            prefill_cu_q = cu_seqlens_q[n_dec:] - cu_seqlens_q[n_dec]
+    set_batch_split(
+        n_dec,
+        n_dec_tok,
+        int(num_q_tokens),
+        decode_pages=decode_pages,
+        prefill_cu_k=prefill_cu_k,
+        prefill_cu_q=prefill_cu_q,
+    )
+
+
+def _cached_decode_pages(
+    num_seqs: int,
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    if _BATCH_SPLIT["decode_pages"] is None:
+        return None
+    if int(_BATCH_SPLIT["decode_n"]) != int(num_seqs):
+        return None
+    return _BATCH_SPLIT["decode_pages"]
 
 
 def _usable_batch_split(num_q_tokens: int, batch: int) -> Optional[tuple[int, int]]:
@@ -407,6 +486,7 @@ def try_ixformer_unified_attention(
             seqused_k=seqused_k,
             softmax_scale=softmax_scale,
             max_seqlen_k=max_seqlen_k,
+            pages=_cached_decode_pages(int(block_table.shape[0])),
         )
         return True
 
@@ -431,6 +511,10 @@ def try_ixformer_unified_attention(
             return False
         _STATS["split"] += 1
         _log_dispatch("split", q, k, reason=f"decode={n_dec} prefill={batch - n_dec}")
+        pages = _cached_decode_pages(n_dec)
+        cu_q_pref = _BATCH_SPLIT["prefill_cu_q"]
+        if cu_q_pref is None:
+            cu_q_pref = cu_seqlens_q[n_dec:] - cu_seqlens_q[n_dec]
         paged_attention_decode(
             out=out[:n_dec_tok],
             query=q[:n_dec_tok],
@@ -440,13 +524,14 @@ def try_ixformer_unified_attention(
             seqused_k=seqused_k[:n_dec],
             softmax_scale=softmax_scale,
             max_seqlen_k=max_seqlen_k,
+            pages=pages,
         )
         flash_attn_prefill(
             out=out[n_dec_tok:],
             query=q[n_dec_tok:],
             key_cache=k,
             value_cache=v,
-            cu_seqlens_q=cu_seqlens_q[n_dec:] - cu_seqlens_q[n_dec],
+            cu_seqlens_q=cu_q_pref,
             max_seqlen_q=max_seqlen_q,
             seqused_k=seqused_k[n_dec:],
             max_seqlen_k=max_seqlen_k,
@@ -455,6 +540,7 @@ def try_ixformer_unified_attention(
             causal=causal,
             window_size=window_size,
             softcap=softcap,
+            cu_seqlens_k=_BATCH_SPLIT["prefill_cu_k"],
         )
         return True
 

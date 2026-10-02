@@ -22,11 +22,14 @@ from flag_gems.runtime.backend._iluvatar.fused.paged_attention_decode import (
     _bndh_to_hnd,
 )
 from flag_gems.runtime.backend._iluvatar.fused.ixformer_unified_attention import (
+    _BATCH_SPLIT,
+    _cached_decode_pages,
     _classify_prefill_batch,
     _decode_is_unsafe,
     _is_supported_ixformer_call,
     _usable_batch_split,
     clear_batch_split,
+    prebuild_split_meta,
     set_batch_split,
 )
 
@@ -169,3 +172,46 @@ def test_ixformer_rejects_noncontiguous_head_dim():
     cache = torch.empty((2, 16, 2, 128), dtype=torch.bfloat16)[..., ::2]
     assert cache.shape == (2, 16, 2, 64)
     assert not _ixformer_supports_cache(cache)
+
+
+def test_prebuild_split_meta_stashes_pages_and_cu_for_mixed_batch():
+    # 4 decode rows + one 8-token chunk.  Metadata must be reusable across the
+    # 42 layers of a step, so the stash has to hold real tensors, not just counts.
+    n_dec, chunk = 4, 8
+    page_size, max_pages = 16, 4
+    device = "cpu"
+    bt = torch.arange( (n_dec + 1) * max_pages, dtype=torch.int32, device=device).reshape(
+        n_dec + 1, max_pages
+    )
+    sk = torch.tensor([32, 48, 16, 64, 80], dtype=torch.int32, device=device)
+    q_lens = torch.tensor([1] * n_dec + [chunk], dtype=torch.int32, device=device)
+    cu = torch.zeros(n_dec + 2, dtype=torch.int32, device=device)
+    cu[1:] = torch.cumsum(q_lens, 0)
+
+    prebuild_split_meta(
+        n_dec, n_dec, int(q_lens.sum()), bt, sk, cu, page_size
+    )
+    assert _usable_batch_split(int(q_lens.sum()), n_dec + 1) == (n_dec, n_dec)
+    pages = _cached_decode_pages(n_dec)
+    assert pages is not None
+    indptr, indices, last_page_len = pages
+    assert indptr.shape == (n_dec + 1,)
+    assert last_page_len.shape == (n_dec,)
+    assert _BATCH_SPLIT["prefill_cu_k"] is not None
+    assert _BATCH_SPLIT["prefill_cu_k"].tolist() == [0, 80]
+    assert _BATCH_SPLIT["prefill_cu_q"].tolist() == [0, chunk]
+    # Wrong sequence count must not reuse the decode pages.
+    assert _cached_decode_pages(n_dec + 1) is None
+
+
+def test_prebuild_split_meta_pure_decode_stashes_pages_only():
+    n, page_size, max_pages = 8, 16, 2
+    bt = torch.arange(n * max_pages, dtype=torch.int32).reshape(n, max_pages)
+    sk = torch.full((n,), 24, dtype=torch.int32)
+    cu = torch.arange(n + 1, dtype=torch.int32)
+    prebuild_split_meta(n, n, n, bt, sk, cu, page_size)
+    # Pure decode is not a "usable split" (no prefill half), but pages are there.
+    assert _usable_batch_split(n, n) is None
+    assert _cached_decode_pages(n) is not None
+    assert _BATCH_SPLIT["prefill_cu_k"] is None
+    assert _BATCH_SPLIT["prefill_cu_q"] is None
