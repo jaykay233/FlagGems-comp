@@ -130,9 +130,13 @@ def set_batch_split(
     )
     _BATCH_SPLIT["prefill_cu_k"] = prefill_cu_k
     _BATCH_SPLIT["prefill_cu_q"] = prefill_cu_q
+    _GRAPH_PAGES["key"] = None
+    _GRAPH_PAGES["pages"] = None
 
 
 def clear_batch_split() -> None:
+    _GRAPH_PAGES["key"] = None
+    _GRAPH_PAGES["pages"] = None
     _BATCH_SPLIT["num_decodes"] = -1
     _BATCH_SPLIT["num_decode_tokens"] = -1
     _BATCH_SPLIT["num_q_tokens"] = -1
@@ -188,11 +192,42 @@ def prebuild_split_meta(
 def _cached_decode_pages(
     num_seqs: int,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    # The stash is reallocated every step, so a captured graph would replay
+    # against freed memory.  Under capture use ``_graph_decode_pages`` instead.
+    if torch.cuda.is_current_stream_capturing():
+        return None
     if _BATCH_SPLIT["decode_pages"] is None:
         return None
     if int(_BATCH_SPLIT["decode_n"]) != int(num_seqs):
         return None
     return _BATCH_SPLIT["decode_pages"]
+
+
+# Pages built inside the graph being captured: the first decode layer's build
+# kernels are captured (so each replay recomputes them from the persistent
+# block_table / seq_lens), and the remaining layers read the same tensors.
+# Reset whenever the builder publishes a new step, i.e. before every capture.
+_GRAPH_PAGES: dict = {"key": None, "pages": None}
+
+
+def _graph_decode_pages(
+    block_table: torch.Tensor, seqused_k: torch.Tensor, page_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from .paged_attention_decode import _build_flashinfer_pages
+
+    key = (
+        block_table.data_ptr(),
+        tuple(block_table.shape),
+        seqused_k.data_ptr(),
+        int(seqused_k.shape[0]),
+        int(page_size),
+    )
+    if _GRAPH_PAGES["key"] != key:
+        _GRAPH_PAGES["pages"] = _build_flashinfer_pages(
+            block_table, seqused_k, page_size
+        )
+        _GRAPH_PAGES["key"] = key
+    return _GRAPH_PAGES["pages"]
 
 
 def _usable_batch_split(num_q_tokens: int, batch: int) -> Optional[tuple[int, int]]:
@@ -477,6 +512,10 @@ def try_ixformer_unified_attention(
             return False
         _STATS["decode"] += 1
         _log_dispatch("decode", q, k)
+        if torch.cuda.is_current_stream_capturing():
+            pages = _graph_decode_pages(block_table, seqused_k, int(k.shape[1]))
+        else:
+            pages = _cached_decode_pages(int(block_table.shape[0]))
         paged_attention_decode(
             out=out,
             query=q,
@@ -486,7 +525,7 @@ def try_ixformer_unified_attention(
             seqused_k=seqused_k,
             softmax_scale=softmax_scale,
             max_seqlen_k=max_seqlen_k,
-            pages=_cached_decode_pages(int(block_table.shape[0])),
+            pages=pages,
         )
         return True
 

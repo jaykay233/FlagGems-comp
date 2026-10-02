@@ -215,3 +215,74 @@ def test_prebuild_split_meta_pure_decode_stashes_pages_only():
     assert _cached_decode_pages(n) is not None
     assert _BATCH_SPLIT["prefill_cu_k"] is None
     assert _BATCH_SPLIT["prefill_cu_q"] is None
+
+
+def _ixformer_available():
+    try:
+        import ixformer.inference.functions.paged_attention  # noqa: F401
+    except Exception:
+        return False
+    return torch.cuda.is_available()
+
+
+@pytest.mark.skipif(not _ixformer_available(), reason="needs ixformer + GPU")
+def test_decode_graph_replay_ignores_the_per_step_page_stash():
+    # The builder republishes freshly allocated pages every step.  A FULL decode
+    # graph that captured the stash would replay against freed (and possibly
+    # reused) memory, so it must rebuild pages from block_table/seq_lens inside
+    # the graph instead.
+    from flag_gems.runtime.backend._iluvatar.fused.paged_attention_decode import (
+        paged_attention_decode,
+    )
+    from flag_gems.runtime.backend._iluvatar.fused.ixformer_unified_attention import (
+        try_ixformer_unified_attention,
+    )
+
+    torch.manual_seed(0)
+    dev, dt = "cuda", torch.bfloat16
+    batch, heads, kv_heads, dim, page_size, max_pages = 48, 16, 2, 128, 16, 192
+    num_blocks = batch * max_pages + 1
+    # HND storage seen through vLLM's BNDH view, as select_hnd_kv_cache_layout does
+    k = torch.randn(num_blocks, kv_heads, page_size, dim, device=dev, dtype=dt)
+    v = torch.randn_like(k)
+    k, v = k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
+    q = torch.randn(batch, heads, dim, device=dev, dtype=dt)
+    out = torch.empty_like(q)
+    bt = torch.randperm(num_blocks - 1, device=dev, dtype=torch.int32)[
+        : batch * max_pages
+    ].reshape(batch, max_pages)
+    sk = torch.ones(batch, device=dev, dtype=torch.int32)
+    cu = torch.arange(batch + 1, device=dev, dtype=torch.int32)
+    scale = dim**-0.5
+
+    def step():
+        prebuild_split_meta(batch, batch, batch, bt, sk, cu, page_size)
+
+    def attend():
+        assert try_ixformer_unified_attention(
+            q, k, v, out, cu, 1, sk, page_size * max_pages, scale, True,
+            block_table=bt,
+        )
+
+    step()
+    attend()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        attend()
+
+    for it in range(3):
+        sk.copy_(torch.randint(1024, page_size * max_pages, (batch,), device=dev))
+        bt.copy_(bt[torch.randperm(batch, device=dev)])
+        step()
+        # churn the allocator so freed stash blocks get new contents
+        junk = [torch.full((batch * max_pages,), 10**6, device=dev, dtype=torch.int32)
+                for _ in range(8)]
+        graph.replay()
+        ref = paged_attention_decode(
+            torch.empty_like(q), q, k, v, bt, sk, scale,
+            max_seqlen_k=page_size * max_pages,
+        )
+        torch.cuda.synchronize()
+        del junk
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=0)
