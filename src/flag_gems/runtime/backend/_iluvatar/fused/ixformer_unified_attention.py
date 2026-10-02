@@ -28,6 +28,7 @@ import torch
 
 from .flash_attn_prefill import flash_attn_prefill
 from .paged_attention_decode import paged_attention_decode
+from .paged_decode_splitk import paged_decode_splitk
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,8 @@ _STATS = {
     "short_skip": 0,
     "decode_unsafe_skip": 0,
     "split_unsafe_skip": 0,
+    "decode_splitk": 0,
+    "split_splitk": 0,
     "unsupported": 0,
     "layout": 0,
 }
@@ -54,6 +57,8 @@ _logged_first = {
     "mixed_skip": False,
     "short_skip": False,
     "decode_unsafe_skip": False,
+    "decode_splitk": False,
+    "split_splitk": False,
     "split": False,
     "split_unsafe_skip": False,
 }
@@ -83,6 +88,25 @@ _DECODE_UNSAFE_CTX = 2048
 def _decode_is_unsafe(batch: int, max_seqlen_k: int) -> bool:
     """Both arguments are host-side already, so this costs no sync."""
     return batch < _DECODE_MIN_BATCH and max_seqlen_k >= _DECODE_UNSAFE_CTX
+
+
+def _splitk_enabled() -> bool:
+    return os.getenv("VLLM_FL_ILUVATAR_SPLITK_DECODE", "1") != "0"
+
+
+def _splitk_is_usable(q: torch.Tensor, k: torch.Tensor, out: torch.Tensor) -> bool:
+    """Shapes the split-K decode kernel indexes directly.
+
+    It walks the KV cache with explicit strides but assumes the head dimension
+    is contiguous and a power of two, and that the GQA group divides evenly.
+    """
+    head_dim = q.shape[-1]
+    if head_dim & (head_dim - 1):
+        return False
+    if q.stride(-1) != 1 or out.stride(-1) != 1 or k.stride(-1) != 1:
+        return False
+    num_kv_heads = k.shape[2]
+    return num_kv_heads > 0 and q.shape[1] % num_kv_heads == 0
 
 
 # Where the decode rows end in a reordered batch.  ``unified_attention`` only
@@ -505,6 +529,22 @@ def try_ixformer_unified_attention(
     # Decode: every sequence has q_len == 1.
     if int(max_seqlen_q) == 1:
         if _decode_is_unsafe(int(block_table.shape[0]), int(max_seqlen_k)):
+            # flashinfer is out, and Triton walks the whole context in one
+            # program per (sequence, KV head) -- exactly the shape the split-K
+            # kernel exists for (§17.16.6).
+            if _splitk_enabled() and _splitk_is_usable(q, k, out):
+                _STATS["decode_splitk"] += 1
+                _log_dispatch("decode_splitk", q, k, reason="small_batch_long_ctx")
+                paged_decode_splitk(
+                    out=out,
+                    query=q,
+                    key_cache=k,
+                    value_cache=v,
+                    block_table=block_table,
+                    seqused_k=seqused_k,
+                    softmax_scale=softmax_scale,
+                )
+                return True
             _STATS["decode_unsafe_skip"] += 1
             _log_dispatch(
                 "decode_unsafe_skip", q, k, reason="flashinfer_small_batch_long_ctx"
@@ -538,33 +578,46 @@ def try_ixformer_unified_attention(
     split = _usable_batch_split(num_q_tokens, batch)
     if split is not None and _split_enabled():
         n_dec, n_dec_tok = split
-        if _decode_is_unsafe(n_dec, int(max_seqlen_k)):
-            # Mixed batches run eager, so unlike pure decode they get no
-            # shelter from graph capture.  The decode slice is also smaller
-            # than the whole batch, so it can fall into the flashinfer corner
-            # even when the batch does not.
+        # Mixed batches run eager, so unlike pure decode they get no shelter
+        # from graph capture.  The decode slice is also smaller than the whole
+        # batch, so it can fall into the flashinfer corner even when the batch
+        # does not -- in which case the decode rows go to split-K instead.
+        decode_unsafe = _decode_is_unsafe(n_dec, int(max_seqlen_k))
+        use_splitk = decode_unsafe and _splitk_enabled() and _splitk_is_usable(q, k, out)
+        if decode_unsafe and not use_splitk:
             _STATS["split_unsafe_skip"] += 1
             _log_dispatch(
                 "split_unsafe_skip", q, k, reason="decode_slice_below_min_batch"
             )
             return False
-        _STATS["split"] += 1
-        _log_dispatch("split", q, k, reason=f"decode={n_dec} prefill={batch - n_dec}")
-        pages = _cached_decode_pages(n_dec)
+        stat = "split_splitk" if use_splitk else "split"
+        _STATS[stat] += 1
+        _log_dispatch(stat, q, k, reason=f"decode={n_dec} prefill={batch - n_dec}")
         cu_q_pref = _BATCH_SPLIT["prefill_cu_q"]
         if cu_q_pref is None:
             cu_q_pref = cu_seqlens_q[n_dec:] - cu_seqlens_q[n_dec]
-        paged_attention_decode(
-            out=out[:n_dec_tok],
-            query=q[:n_dec_tok],
-            key_cache=k,
-            value_cache=v,
-            block_table=block_table[:n_dec],
-            seqused_k=seqused_k[:n_dec],
-            softmax_scale=softmax_scale,
-            max_seqlen_k=max_seqlen_k,
-            pages=pages,
-        )
+        if use_splitk:
+            paged_decode_splitk(
+                out=out[:n_dec_tok],
+                query=q[:n_dec_tok],
+                key_cache=k,
+                value_cache=v,
+                block_table=block_table[:n_dec],
+                seqused_k=seqused_k[:n_dec],
+                softmax_scale=softmax_scale,
+            )
+        else:
+            paged_attention_decode(
+                out=out[:n_dec_tok],
+                query=q[:n_dec_tok],
+                key_cache=k,
+                value_cache=v,
+                block_table=block_table[:n_dec],
+                seqused_k=seqused_k[:n_dec],
+                softmax_scale=softmax_scale,
+                max_seqlen_k=max_seqlen_k,
+                pages=_cached_decode_pages(n_dec),
+            )
         flash_attn_prefill(
             out=out[n_dec_tok:],
             query=q[n_dec_tok:],

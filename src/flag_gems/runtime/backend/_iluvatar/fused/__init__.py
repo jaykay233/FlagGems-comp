@@ -24,6 +24,7 @@ from .ixformer_unified_attention import (
 )
 from .matmul_bias_activation import matmul_bias_activation
 from .paged_attention_decode import paged_attention_decode
+from .paged_decode_splitk import paged_decode_splitk
 from .sparse_attention import sparse_attn_triton
 from .top_k_per_row_prefill import top_k_per_row_prefill
 
@@ -38,6 +39,7 @@ __all__ = [
     "reset_dispatch_stats",
     "matmul_bias_activation",
     "paged_attention_decode",
+    "paged_decode_splitk",
     "sparse_attn_triton",
     "top_k_per_row_prefill",
 ]
