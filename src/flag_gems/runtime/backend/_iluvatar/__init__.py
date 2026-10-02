@@ -35,9 +35,29 @@ vendor_info = VendorDescriptor(
     fp64_enabled=False,
 )
 
-# FlagGems' Triton ``add`` costs ~0.34 ms of host per call on BI-V150 while the
-# GPU kernel is ~0.06 ms; eager prefill steps issue ~89 adds (~30 ms host).
-# Native aten::add launches in ~0.01 ms.
-CUSTOMIZED_UNUSED_OPS = ("add",)
+# Small eager-path ops (residual add, attention/sampler metadata) stay on native
+# aten.  On BI-V150 a FlagGems Triton pointwise launch costs ~0.3 ms of host vs
+# ~0.01 ms native, and several of these JIT a new kernel per input shape or
+# specialization (``index`` keys its code cache on the full input shape), which
+# stalls the first serving pass for tens of seconds on a cold Triton cache.
+CUSTOMIZED_UNUSED_OPS = (
+    "add",
+    "sub",
+    "index",
+    "copy_",
+    "to_copy",
+    "eq",
+    "eq_scalar",
+    "floor_divide",
+    "remainder",
+    "where_self",
+    "cumsum",
+    "full",
+    "full_like",
+    "fill_scalar_",
+    "zeros",
+    "zeros_like",
+    "zero_",
+)
 
 __all__ = ["*"]
