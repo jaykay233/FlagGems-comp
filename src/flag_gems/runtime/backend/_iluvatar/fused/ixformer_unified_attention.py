@@ -230,6 +230,11 @@ def prebuild_split_meta(
             prefill_cu_k = _cu_seqlens_from_seqused(seqused_k[n_dec:])
             # Stay on-device: cu_seqlens_q[n_dec] is a 0-d tensor, not a Python int.
             prefill_cu_q = cu_seqlens_q[n_dec:] - cu_seqlens_q[n_dec]
+    elif n_dec == 0 and batch > 0:
+        # Pure-prefill step: stash cu_seqlens_k once so FA does not rebuild
+        # zeros+cumsum on every layer (device work, no D2H, but 42× launches).
+        prefill_cu_k = _cu_seqlens_from_seqused(seqused_k)
+        prefill_cu_q = cu_seqlens_q
     min_q_len = _min_q_len_from_cpu_cu(query_start_loc_cpu)
     set_batch_split(
         n_dec,
@@ -816,6 +821,14 @@ def try_ixformer_unified_attention(
 
     _STATS["prefill"] += 1
     _log_dispatch("prefill", q, k, reason="shape_gated_pure_prefill_fa")
+    # Prefer once-per-step cu_seqlens_k when the stash matches this batch.
+    cu_k = None
+    if (
+        int(_BATCH_SPLIT["num_q_tokens"]) == num_q_tokens
+        and int(_BATCH_SPLIT["batch"]) == batch
+        and int(_BATCH_SPLIT["num_decodes"]) == 0
+    ):
+        cu_k = _BATCH_SPLIT["prefill_cu_k"]
     flash_attn_prefill(
         out=out,
         query=q,
@@ -827,6 +840,7 @@ def try_ixformer_unified_attention(
         max_seqlen_k=max_seqlen_k,
         block_table=block_table,
         softmax_scale=softmax_scale,
+        cu_seqlens_k=cu_k,
         causal=causal,
         window_size=window_size if window_size is not None else (-1, -1),
         softcap=float(softcap or 0.0),
