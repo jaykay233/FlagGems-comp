@@ -27,7 +27,7 @@ from typing import Optional
 import torch
 
 from .flash_attn_prefill import flash_attn_prefill
-from .paged_attention_decode import paged_attention_decode
+from .paged_attention_decode import paged_attention_decode, paged_attention_mtp
 from .paged_decode_splitk import paged_decode_splitk
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,7 @@ _STATS = {
     "split_unsafe_skip": 0,
     "decode_splitk": 0,
     "split_splitk": 0,
+    "spec_mtp": 0,
     "unsupported": 0,
     "layout": 0,
 }
@@ -61,6 +62,7 @@ _logged_first = {
     "split_splitk": False,
     "split": False,
     "split_unsafe_skip": False,
+    "spec_mtp": False,
 }
 
 
@@ -273,13 +275,45 @@ def _usable_batch_split(num_q_tokens: int, batch: int) -> Optional[tuple[int, in
         return None
     return n_dec, n_dec_tok
 
-# Pure-prefill FA only when every sequence's q_len is at least this.
-# FA beats Triton on pure chunks down to q=256 (serve_shape_fa_vs_triton.txt),
-# so this is not really a quality threshold any more: it is what lets a mixed
-# batch be rejected from host-side shapes alone, without a sync.  Values below
-# 2 would force the exact check on every call.
-# Override with VLLM_FL_ILUVATAR_IXFORMER_PREFILL_MIN_Q.
+# Pure-prefill FA shape gate.  Calibrated on jagged_prefill_micro.txt:
+# FA wins on few medium/long chunks; loses when n_seq is large and q is short
+# (cost tracks sequence count).  ``PREFILL_MIN_Q`` is the *cheap* sync-free
+# reject floor for large batches (decode+chunk mixed), not the only admit rule.
+# Override floor with VLLM_FL_ILUVATAR_IXFORMER_PREFILL_MIN_Q.
+# Disable the (n_seq, min_q, kv_len) table with
+# VLLM_FL_ILUVATAR_IXFORMER_PREFILL_SHAPE_GATE=0 (then only min_q floor).
 _DEFAULT_PREFILL_MIN_Q = 256
+# Below this, microbench never saw a clear FA win.
+_FA_Q_FLOOR = 64
+# Only small batches may sync to consider q in [_FA_Q_FLOOR, MIN_Q).
+_FA_SYNC_MAX_SEQS = 16
+
+
+def _spec_mtp_enabled() -> bool:
+    return os.getenv("VLLM_FL_ILUVATAR_SPEC_MTP", "1") != "0"
+
+
+def _spec_q_max() -> int:
+    raw = os.getenv("VLLM_FL_ILUVATAR_SPEC_Q_MAX", "4")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 4
+
+
+def _short_spec_batch(max_seqlen_q: int, num_q_tokens: int, batch: int) -> bool:
+    """True for a short speculative-verify shaped batch.
+
+    n-gram rarely fills every sequence with a draft, so the batch is often
+    mixed q=1 and q=2. ``vllm_paged_attention_mtp`` already takes
+    ``cu_seqlens_q``, so uniformity is not required. Cap ``max_seqlen_q`` so
+    long / chunked prefills stay on the FA or Triton paths.
+    """
+    q = int(max_seqlen_q)
+    if batch <= 0 or q <= 1 or q > _spec_q_max():
+        return False
+    # At least one sequence must actually be verifying (q > 1).
+    return int(num_q_tokens) > batch
 
 
 def _prefill_min_q() -> int:
@@ -292,6 +326,30 @@ def _prefill_min_q() -> int:
         return _DEFAULT_PREFILL_MIN_Q
 
 
+def _prefill_shape_gate_enabled() -> bool:
+    return os.getenv("VLLM_FL_ILUVATAR_IXFORMER_PREFILL_SHAPE_GATE", "1") != "0"
+
+
+def _fa_prefill_shape_ok(n_seq: int, min_q: int, kv_len: int) -> bool:
+    """Whether pure-prefill FA should beat Triton for this shape.
+
+    From jagged_prefill_micro (FA/Triton): 8×256 ≈2.5×; 8×64@kv≥1k ≈1.26×;
+    8×128 ≈win; 16×256 win; 16×128 ≈1.23× (skip); 32×64 / many short jagged
+    ≈0.56× (skip).
+    """
+    if n_seq <= 0 or min_q < _FA_Q_FLOOR:
+        return False
+    if n_seq <= 8 and min_q >= 256:
+        return True
+    if n_seq <= 8 and min_q >= 128:
+        return True
+    if n_seq <= 8 and min_q >= _FA_Q_FLOOR and int(kv_len) >= 1024:
+        return True
+    if n_seq <= 16 and min_q >= 256:
+        return True
+    return False
+
+
 def _q_lens_from_cu(cu_seqlens_q: torch.Tensor) -> torch.Tensor:
     return cu_seqlens_q[1:] - cu_seqlens_q[:-1]
 
@@ -301,31 +359,53 @@ def _classify_prefill_batch(
     max_seqlen_q: int,
     num_q_tokens: int,
     min_q: int,
+    max_seqlen_k: int = 0,
 ) -> str:
     """Return ``prefill``, ``mixed``, or ``short`` for max_seqlen_q > 1.
 
-    Only the last check reads ``cu_seqlens_q`` on the host, which costs a
-    device->host sync.  Paying that on every mixed step is what the official
-    4k serve feels as higher TTFT, so the cheap shape-only tests reject the
-    common decode+prefill batches first; ``mixed`` vs ``short`` there is a
-    label for diagnostics, both fall back to Triton either way.
+    Cheap shape-only tests reject common decode+prefill batches without a
+    device->host sync.  Small pure-prefill packs with q in [64, min_q) may
+    sync once to apply the (n_seq, min_q, kv_len) FA table.
     """
     batch = int(cu_seqlens_q.numel()) - 1
     if batch <= 0:
         return "short"
-    if min_q > 0:
-        if int(max_seqlen_q) < min_q:
+
+    max_q = int(max_seqlen_q)
+    tokens = int(num_q_tokens)
+    kv = int(max_seqlen_k)
+    use_shape = _prefill_shape_gate_enabled()
+
+    if max_q < _FA_Q_FLOOR:
+        return "short"
+
+    # Sync-free: large batch that cannot be all-long under the cheap floor is
+    # almost always decode+chunk mixed on the official serve path.
+    cheap_floor = min_q if min_q > 0 else _DEFAULT_PREFILL_MIN_Q
+    if cheap_floor > 0 and tokens < batch * cheap_floor:
+        if batch > _FA_SYNC_MAX_SEQS or not use_shape:
+            # max_q below the floor ⇒ many short pure chunks; else mixed.
+            return "short" if max_q < cheap_floor else "mixed"
+        # Small batch: may be short-jagged pure prefill worth a sync.
+        if max_q < cheap_floor and batch > 8:
             return "short"
-        # All q_len >= min_q implies num_q_tokens >= batch * min_q, so a batch
-        # failing this cannot be an all-long pure prefill.
-        if num_q_tokens < batch * min_q:
+
+    # Legacy / shape-gate-off: require max_q >= cheap_floor before syncing.
+    if not use_shape:
+        if cheap_floor > 0 and max_q < cheap_floor:
+            return "short"
+        if cheap_floor > 0 and tokens < batch * cheap_floor:
             return "mixed"
 
     q_lens = _q_lens_from_cu(cu_seqlens_q)
     min_len = int(q_lens.min().item())
     if min_len == 1:
         return "mixed"
-    if min_q > 0 and min_len < min_q:
+    if use_shape:
+        if _fa_prefill_shape_ok(batch, min_len, kv):
+            return "prefill"
+        return "short"
+    if cheap_floor > 0 and min_len < cheap_floor:
         return "short"
     return "prefill"
 
@@ -569,6 +649,44 @@ def try_ixformer_unified_attention(
         )
         return True
 
+    # Speculative verify: short q=2..4. FA varlen is ~10x slower here, and
+    # Triton would re-read KV per query. MTP scans KV once. Drafts are often
+    # sparse across the batch, so cu_seqlens may be mixed q=1/q=2. vLLM's
+    # query buffer is frequently a non-contiguous view; ixformer requires
+    # contiguous Q/O, so materialize when needed.
+    batch = int(block_table.shape[0])
+    num_q_tokens = int(q.shape[0])
+    if (
+        causal
+        and _spec_mtp_enabled()
+        and _short_spec_batch(max_seqlen_q, num_q_tokens, batch)
+    ):
+        n_kv = int(k.shape[2])
+        n_heads = int(q.shape[1])
+        if n_kv > 0 and (n_heads // n_kv) * int(max_seqlen_q) > 4:
+            q_m = q if q.is_contiguous() else q.contiguous()
+            if out.is_contiguous():
+                out_m = out
+            else:
+                out_m = torch.empty_like(q_m)
+            _STATS["spec_mtp"] += 1
+            _log_dispatch("spec_mtp", q_m, k, reason=f"short_q={int(max_seqlen_q)}")
+            paged_attention_mtp(
+                out=out_m,
+                query=q_m,
+                key_cache=k,
+                value_cache=v,
+                block_table=block_table,
+                seqused_k=seqused_k,
+                cu_seqlens_q=cu_seqlens_q,
+                softmax_scale=softmax_scale,
+                max_seqlen_q=int(max_seqlen_q),
+                max_seqlen_k=int(max_seqlen_k),
+            )
+            if out_m is not out:
+                out.copy_(out_m)
+            return True
+
     # Mixed batch: if vLLM reordered it, the decode rows form a contiguous
     # prefix and the two halves can go to the kernel each is good at.  FA costs
     # ~0.21 ms per sequence on a mixed batch because every decode row pays a
@@ -637,9 +755,13 @@ def try_ixformer_unified_attention(
         return True
 
     # Not reordered (or not mixed): mixed or short chunks stay on Triton
-    # tile64; only large pure-prefill batches take ixformer FA (§17.6).
+    # tile64; pure-prefill FA uses (n_seq, min_q, kv_len) shape gate.
     kind = _classify_prefill_batch(
-        cu_seqlens_q, max_seqlen_q, num_q_tokens, _prefill_min_q()
+        cu_seqlens_q,
+        max_seqlen_q,
+        num_q_tokens,
+        _prefill_min_q(),
+        max_seqlen_k=int(max_seqlen_k),
     )
     if kind == "mixed":
         _STATS["mixed_skip"] += 1
@@ -651,7 +773,7 @@ def try_ixformer_unified_attention(
         return False
 
     _STATS["prefill"] += 1
-    _log_dispatch("prefill", q, k, reason="large_pure_prefill_fa")
+    _log_dispatch("prefill", q, k, reason="shape_gated_pure_prefill_fa")
     flash_attn_prefill(
         out=out,
         query=q,

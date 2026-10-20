@@ -129,3 +129,55 @@ def paged_attention_decode(
         kv_cache_format="HND",
     )
     return out
+
+
+def paged_attention_mtp(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    softmax_scale: float,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+) -> torch.Tensor:
+    """Uniform short-query paged attention (speculative verify).
+
+    ``vllm_paged_attention_mtp`` keeps every query of one sequence in one
+    tile, so the KV cache is read once. q=2 and q=4 cost the same as q=1
+    on this card. The last query attends to ``seqused_k`` tokens; earlier
+    queries of the same sequence see a shorter causal prefix.
+    """
+    from ixformer.inference.functions.vllm import vllm_paged_attention_mtp
+
+    if not query.is_contiguous() or not out.is_contiguous():
+        raise ValueError("paged_attention_mtp requires contiguous query and out")
+    k_hnd = _bndh_to_hnd(key_cache)
+    v_hnd = _bndh_to_hnd(value_cache)
+    if not k_hnd.is_contiguous() or not v_hnd.is_contiguous():
+        raise ValueError("paged_attention_mtp requires contiguous HND KV")
+    num_kv_heads = int(k_hnd.shape[1])
+    page_size = int(k_hnd.shape[2])
+    num_heads = int(query.shape[1])
+    if num_kv_heads <= 0 or (num_heads // num_kv_heads) * int(max_seqlen_q) <= 4:
+        raise ValueError(
+            "paged_attention_mtp shape rejected by ixformer: "
+            f"heads={num_heads} kv_heads={num_kv_heads} q={max_seqlen_q}"
+        )
+    vllm_paged_attention_mtp(
+        out,
+        query,
+        k_hnd,
+        v_hnd,
+        num_kv_heads,
+        float(softmax_scale),
+        block_table,
+        seqused_k,
+        page_size,
+        int(max_seqlen_k),
+        max_query_len=int(max_seqlen_q),
+        cu_query_lens=cu_seqlens_q,
+    )
+    return out
