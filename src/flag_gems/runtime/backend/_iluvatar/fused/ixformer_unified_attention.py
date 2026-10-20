@@ -129,6 +129,9 @@ _BATCH_SPLIT: dict = {
     "decode_n": -1,  # sequences covered by decode_pages
     "prefill_cu_k": None,
     "prefill_cu_q": None,
+    # Host-side min(q_len) from query_start_loc_cpu (no GPU D2H). -1 = unset.
+    "min_q_len": -1,
+    "batch": -1,
 }
 
 
@@ -139,6 +142,8 @@ def set_batch_split(
     decode_pages: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     prefill_cu_k: Optional[torch.Tensor] = None,
     prefill_cu_q: Optional[torch.Tensor] = None,
+    min_q_len: int = -1,
+    batch: int = -1,
 ) -> None:
     """Publish the decode/prefill boundary of the current step's batch.
 
@@ -146,6 +151,8 @@ def set_batch_split(
     the batch it was handed, rather than to some other KV cache group.
     Optional ``decode_pages`` / ``prefill_cu_*`` are the once-per-step metadata
     kernels; omit them and every layer rebuilds (the old behaviour).
+    ``min_q_len`` is from host ``query_start_loc_cpu`` so the FA shape gate
+    never needs ``cu_seqlens_q.min().item()`` (GPU D2H) on the hot path.
     """
     _BATCH_SPLIT["num_decodes"] = int(num_decodes)
     _BATCH_SPLIT["num_decode_tokens"] = int(num_decode_tokens)
@@ -156,6 +163,8 @@ def set_batch_split(
     )
     _BATCH_SPLIT["prefill_cu_k"] = prefill_cu_k
     _BATCH_SPLIT["prefill_cu_q"] = prefill_cu_q
+    _BATCH_SPLIT["min_q_len"] = int(min_q_len)
+    _BATCH_SPLIT["batch"] = int(batch)
     _GRAPH_PAGES["key"] = None
     _GRAPH_PAGES["pages"] = None
 
@@ -170,6 +179,19 @@ def clear_batch_split() -> None:
     _BATCH_SPLIT["decode_n"] = -1
     _BATCH_SPLIT["prefill_cu_k"] = None
     _BATCH_SPLIT["prefill_cu_q"] = None
+    _BATCH_SPLIT["min_q_len"] = -1
+    _BATCH_SPLIT["batch"] = -1
+
+
+def _min_q_len_from_cpu_cu(query_start_loc_cpu: torch.Tensor) -> int:
+    """``min(q_len)`` from a host cu_seqlens; no device sync."""
+    if query_start_loc_cpu is None or query_start_loc_cpu.numel() < 2:
+        return -1
+    # Ensure CPU: a CUDA tensor here would reintroduce the D2H we are removing.
+    if query_start_loc_cpu.is_cuda:
+        return -1
+    q_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+    return int(q_lens.min().item())
 
 
 def prebuild_split_meta(
@@ -180,12 +202,15 @@ def prebuild_split_meta(
     seqused_k: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     page_size: int,
+    query_start_loc_cpu: Optional[torch.Tensor] = None,
 ) -> None:
     """Build flashinfer/FA metadata once and publish it with the split.
 
     Called from the attention-metadata builder (once per step).  Covers both
     the mixed-batch split and a pure-decode batch (``num_decodes == batch``),
-    so eager decode layers also reuse the pages.
+    so eager decode layers also reuse the pages.  When
+    ``query_start_loc_cpu`` is supplied, also stash ``min_q_len`` for the
+    sync-free FA shape gate.
     """
     from .flash_attn_prefill import _cu_seqlens_from_seqused
     from .paged_attention_decode import _build_flashinfer_pages
@@ -205,6 +230,7 @@ def prebuild_split_meta(
             prefill_cu_k = _cu_seqlens_from_seqused(seqused_k[n_dec:])
             # Stay on-device: cu_seqlens_q[n_dec] is a 0-d tensor, not a Python int.
             prefill_cu_q = cu_seqlens_q[n_dec:] - cu_seqlens_q[n_dec]
+    min_q_len = _min_q_len_from_cpu_cu(query_start_loc_cpu)
     set_batch_split(
         n_dec,
         n_dec_tok,
@@ -212,6 +238,8 @@ def prebuild_split_meta(
         decode_pages=decode_pages,
         prefill_cu_k=prefill_cu_k,
         prefill_cu_q=prefill_cu_q,
+        min_q_len=min_q_len,
+        batch=batch,
     )
 
 
@@ -354,6 +382,17 @@ def _q_lens_from_cu(cu_seqlens_q: torch.Tensor) -> torch.Tensor:
     return cu_seqlens_q[1:] - cu_seqlens_q[:-1]
 
 
+def _stashed_min_q_len(num_q_tokens: int, batch: int) -> Optional[int]:
+    """Host min(q_len) published by ``prebuild_split_meta``, if it matches."""
+    if int(_BATCH_SPLIT["num_q_tokens"]) != int(num_q_tokens):
+        return None
+    stashed_batch = int(_BATCH_SPLIT["batch"])
+    if stashed_batch >= 0 and stashed_batch != int(batch):
+        return None
+    m = int(_BATCH_SPLIT["min_q_len"])
+    return m if m >= 0 else None
+
+
 def _classify_prefill_batch(
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
@@ -364,8 +403,9 @@ def _classify_prefill_batch(
     """Return ``prefill``, ``mixed``, or ``short`` for max_seqlen_q > 1.
 
     Cheap shape-only tests reject common decode+prefill batches without a
-    device->host sync.  Small pure-prefill packs with q in [64, min_q) may
-    sync once to apply the (n_seq, min_q, kv_len) FA table.
+    device->host sync.  Prefer once-per-step host ``min_q_len`` from
+    ``query_start_loc_cpu``; only fall back to ``cu_seqlens_q.min().item()``
+    when the stash is missing (e.g. split patch off).
     """
     batch = int(cu_seqlens_q.numel()) - 1
     if batch <= 0:
@@ -386,19 +426,21 @@ def _classify_prefill_batch(
         if batch > _FA_SYNC_MAX_SEQS or not use_shape:
             # max_q below the floor ⇒ many short pure chunks; else mixed.
             return "short" if max_q < cheap_floor else "mixed"
-        # Small batch: may be short-jagged pure prefill worth a sync.
+        # Small batch: may be short-jagged pure prefill; prefer stashed min.
         if max_q < cheap_floor and batch > 8:
             return "short"
 
-    # Legacy / shape-gate-off: require max_q >= cheap_floor before syncing.
+    # Legacy / shape-gate-off: require max_q >= cheap_floor before reading lens.
     if not use_shape:
         if cheap_floor > 0 and max_q < cheap_floor:
             return "short"
         if cheap_floor > 0 and tokens < batch * cheap_floor:
             return "mixed"
 
-    q_lens = _q_lens_from_cu(cu_seqlens_q)
-    min_len = int(q_lens.min().item())
+    min_len = _stashed_min_q_len(tokens, batch)
+    if min_len is None:
+        q_lens = _q_lens_from_cu(cu_seqlens_q)
+        min_len = int(q_lens.min().item())
     if min_len == 1:
         return "mixed"
     if use_shape:

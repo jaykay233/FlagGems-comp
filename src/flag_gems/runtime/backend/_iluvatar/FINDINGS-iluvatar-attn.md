@@ -30,3 +30,15 @@ Cheap sync-free reject for large decode+chunk batches still uses floor
 
 Many short jagged packs (e.g. 32×64) are **slower** on FA than Triton — do not
 lower the gate blindly.
+
+### Host `min_q_len` (no GPU D2H)
+
+`prebuild_split_meta(..., query_start_loc_cpu=)` stashes `min(q_len)` once per
+step from the host cu_seqlens. `_classify_prefill_batch` uses that stash so the
+42 attention layers never call `cu_seqlens_q.min().item()` on device.
+
+Plugin wire-up: `TritonAttentionMetadataBuilder.build` passes
+`common_attn_metadata.query_start_loc_cpu`.
+
+E2E (official 4k×2, bf16): Total tok/s **5798** vs prior shape-gate **5788**
+(flat); see plugin FINDINGS §17.30.
