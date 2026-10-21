@@ -14,6 +14,7 @@
 
 import logging
 import math
+import os
 
 import torch
 import triton
@@ -214,8 +215,94 @@ def mm_kernel(
         tl.atomic_add(C, acc, mask=mask)
 
 
+# Skinny-decode hand-picked tiles (ixkn + force-launch sweep, 2026-10-21).
+# LibTuner's mm search space starts at BLOCK_M=32 / num_warps=8 and the
+# CUDA perf_model often keeps fat tiles that leave BI-V150 at ~12–19% occ /
+# ~10–21% TCU for M≈16–32.  These configs beat the autotuned path by
+# ~1.2–1.8× on MiniCPM5-2B's four layer GEMMs; larger M falls through.
+# Keyed by (N, K); values are (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, warps, stages).
+_SKINNY_MM_LE32 = {
+    (2560, 2048): (64, 128, 64, 1, 8, 2),  # qkv
+    (2048, 2048): (32, 64, 128, 1, 4, 2),  # o_proj
+    (12288, 2048): (32, 256, 64, 1, 8, 1),  # gate_up
+    (2048, 6144): (32, 64, 128, 1, 8, 2),  # down
+}
+_SKINNY_MM_LE64 = {
+    (2560, 2048): (64, 64, 64, 1, 4, 2),
+    (2048, 2048): (32, 64, 64, 1, 4, 1),
+    (12288, 2048): (64, 64, 64, 1, 8, 2),
+    (2048, 6144): (64, 64, 128, 1, 8, 2),
+}
+_SKINNY_MM_JIT = None
+
+
+def _skinny_mm_enabled() -> bool:
+    return os.getenv("FLAGGEMS_ILUVATAR_MM_SKINNY", "1") != "0"
+
+
+def _pick_skinny_mm_cfg(M: int, N: int, K: int):
+    if not _skinny_mm_enabled() or M > 64:
+        return None
+    key = (N, K)
+    if M <= 32:
+        return _SKINNY_MM_LE32.get(key)
+    return _SKINNY_MM_LE64.get(key)
+
+
+def _mm_jit():
+    """Underlying Triton JIT (unwrap LibEntry / LibTuner / Heuristics)."""
+    global _SKINNY_MM_JIT
+    if _SKINNY_MM_JIT is None:
+        _SKINNY_MM_JIT = mm_kernel.fn.fn.fn
+    return _SKINNY_MM_JIT
+
+
+def _launch_mm_fixed(a, b, c, M, N, K, cfg):
+    block_m, block_n, block_k, split_k, num_warps, num_stages = cfg
+    ab_dtype_tl = _to_tl_type(get_higher_dtype(a.dtype, b.dtype))
+    if split_k > 1:
+        c.zero_()
+    grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), split_k)
+    with torch_device_fn.device(a.device):
+        _mm_jit()[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            acc_dtype=tl.float32,
+            input_precision=None,
+            fp8_fast_accum=True,
+            GROUP_M=8,
+            AB_DTYPE=ab_dtype_tl,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            SPLIT_K=split_k,
+            EVEN_K=(K % (block_k * split_k) == 0),
+            UPGRADE=False,
+            UPGRADE_A_OFFS=False,
+            UPGRADE_B_OFFS=False,
+            UPGRADE_C_OFFS=False,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    return c
+
+
 def _launch_mm(a, b, c, M, N, K):
     """Launch Triton matmul _kernel; c must be pre-allocated."""
+    cfg = _pick_skinny_mm_cfg(M, N, K)
+    if cfg is not None:
+        return _launch_mm_fixed(a, b, c, M, N, K, cfg)
+
     ab_dtype = get_higher_dtype(a.dtype, b.dtype)
     acc_dtype_tl = tl.float32
     ab_dtype_tl = _to_tl_type(ab_dtype)

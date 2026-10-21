@@ -181,6 +181,9 @@ mm:
     num_warps: warps
     num_stages: stages
   block_m:
+  # 16 / warps=4: decode skinny GEMM (M≈16–32) on BI-V150; see mm.py
+  # _SKINNY_MM_* and ixkn_splitk_retune / gemm force-launch sweep.
+  - 16
   - 32
   - 64
   - 128
@@ -197,6 +200,7 @@ mm:
   split_k:
   - 1
   warps:
+  - 4
   - 8
   - 16
   stages:

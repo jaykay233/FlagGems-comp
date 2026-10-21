@@ -121,6 +121,16 @@ def linear_kernel(
         tl.atomic_add(C, acc.to(output_ptr.dtype.element_ty), mask=mask)
 
 
+_LINEAR_JIT = None
+
+
+def _linear_jit():
+    global _LINEAR_JIT
+    if _LINEAR_JIT is None:
+        _LINEAR_JIT = linear_kernel.fn.fn.fn
+    return _LINEAR_JIT
+
+
 def linear(input, weight, bias=None):
     logger.debug("GEMS_ILUVATAR LINEAR")
 
@@ -143,31 +153,72 @@ def linear(input, weight, bias=None):
     weight = weight.contiguous()
     output = torch.empty((M, N), device=input.device, dtype=input.dtype)
 
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
-        META.get("SPLIT_K", 1),
-    )
+    # No-bias MiniCPM projections: same skinny tiles as mm.py, but keep the
+    # (N,K) weight layout that linear_kernel expects (no weight.t() copy).
+    skinny_cfg = None
+    if bias is None:
+        from .mm import _pick_skinny_mm_cfg
 
-    with torch_device_fn.device(input.device):
-        linear_kernel[grid](
-            input_flat,
-            weight,
-            bias if bias is not None else weight,
-            output,
-            M,
-            N,
-            K,
-            input_flat.stride(0),
-            input_flat.stride(1),
-            weight.stride(0),
-            weight.stride(1),
-            output.stride(0),
-            output.stride(1),
-            bias.stride(0) if bias is not None else 0,
-            BIAS=bias is not None,
-            GROUP_M=8,
-            SPLIT_K=1,
+        skinny_cfg = _pick_skinny_mm_cfg(M, N, K)
+
+    if skinny_cfg is not None:
+        block_m, block_n, block_k, split_k, num_warps, num_stages = skinny_cfg
+        grid = (
+            triton.cdiv(M, block_m) * triton.cdiv(N, block_n),
+            split_k,
         )
+        with torch_device_fn.device(input.device):
+            _linear_jit()[grid](
+                input_flat,
+                weight,
+                weight,  # unused when BIAS=False
+                output,
+                M,
+                N,
+                K,
+                input_flat.stride(0),
+                input_flat.stride(1),
+                weight.stride(0),
+                weight.stride(1),
+                output.stride(0),
+                output.stride(1),
+                0,
+                BIAS=False,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+                GROUP_M=8,
+                SPLIT_K=split_k,
+                EVEN_K=(K % (block_k * split_k) == 0),
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+    else:
+        grid = lambda META: (
+            triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+            META.get("SPLIT_K", 1),
+        )
+
+        with torch_device_fn.device(input.device):
+            linear_kernel[grid](
+                input_flat,
+                weight,
+                bias if bias is not None else weight,
+                output,
+                M,
+                N,
+                K,
+                input_flat.stride(0),
+                input_flat.stride(1),
+                weight.stride(0),
+                weight.stride(1),
+                output.stride(0),
+                output.stride(1),
+                bias.stride(0) if bias is not None else 0,
+                BIAS=bias is not None,
+                GROUP_M=8,
+                SPLIT_K=1,
+            )
 
     output = output.view(*batch_dims, N)
     if single_1d:
