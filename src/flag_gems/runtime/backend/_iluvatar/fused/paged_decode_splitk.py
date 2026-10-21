@@ -35,15 +35,22 @@ import triton.language as tl
 # One program's share of the query rows.  tl.dot wants at least 16 rows, and
 # the GQA group is 8, so the tile is padded and the surplus rows are masked.
 _BLOCK_M = 16
-# Keys per inner iteration.  The KV cache pages 16 tokens, so this is 2 pages.
-# Wider tiles lose: the KV gather is strided, so 32 keeps more loads in flight
-# per program than it saves in loop overhead (splitk_config_sweep.txt).
+# Keys per inner iteration.  Default tile is shape-selected in
+# ``paged_decode_splitk``: BN=32/w4 for tiny batches (n<=2), BN=16/w2
+# otherwise.  ixkn on BI-V150 showed the BN32/w4 kernel stalled ~41% on
+# memory dependency with heavy shared-memory bank conflicts; BN16/w2 cuts
+# that path ~15–19% at n=4..64 / ctx=4k..16k (ixkn_splitk_retune, 2026-10-21).
+# Wider tiles (64+) still lose on the strided KV gather.
 _BLOCK_N = 32
-# Programs to aim for across the grid.  BI-V150 has 16 SMs, and the measured
-# optimum is well past one program per SM: splitting further keeps shrinking
-# the per-program KV walk, which dominates, until the reduction catches up
-# (splitk_heuristic_sweep.txt).
-_TARGET_PROGRAMS = 256
+_BLOCK_N_WIDE = 32
+_BLOCK_N_NARROW = 16
+_NUM_WARPS_WIDE = 4
+_NUM_WARPS_NARROW = 2
+# Tiny decode graphs stay on the wide tile; everything else uses narrow.
+_NARROW_MIN_SEQS = 3
+# Programs to aim for across the grid.  Raised 256→512 so BN16/w2 keeps
+# enough splits at n=24/48 (otherwise those sizes regress vs BN32/w4).
+_TARGET_PROGRAMS = 512
 _MAX_SPLITS = 32
 
 
@@ -288,6 +295,13 @@ def paged_decode_splitk(
     if num_splits is None:
         num_splits = choose_num_splits(num_seqs, num_kv_heads)
 
+    # Shape-selected tile: see module constants.  Must depend only on
+    # num_seqs (not seq_len) so CUDA-graph capture stays valid.
+    if num_seqs < _NARROW_MIN_SEQS:
+        block_n, num_warps = _BLOCK_N_WIDE, _NUM_WARPS_WIDE
+    else:
+        block_n, num_warps = _BLOCK_N_NARROW, _NUM_WARPS_NARROW
+
     acc, lse_m, lse_l = _workspace(
         num_seqs, num_q_heads, num_splits, head_dim, query.device
     )
@@ -322,8 +336,8 @@ def paged_decode_splitk(
         PAGE_SIZE=page_size,
         GROUP=group,
         BLOCK_M=max(_BLOCK_M, triton.next_power_of_2(group)),
-        BLOCK_N=_BLOCK_N,
-        num_warps=4,
+        BLOCK_N=block_n,
+        num_warps=num_warps,
         # One stage: the software pipeline's extra KV buffer costs more shared
         # memory than the strided gather gains from prefetching.
         num_stages=1,
