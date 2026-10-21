@@ -219,7 +219,10 @@ def mm_kernel(
 # LibTuner's mm search space starts at BLOCK_M=32 / num_warps=8 and the
 # CUDA perf_model often keeps fat tiles that leave BI-V150 at ~12–19% occ /
 # ~10–21% TCU for M≈16–32.  These configs beat the autotuned path by
-# ~1.2–1.8× on MiniCPM5-2B's four layer GEMMs; larger M falls through.
+# ~1.2–1.8× on MiniCPM5-2B's four layer GEMMs at M≤32.
+# M>32 falls through: M=64 is already ~80–90% of BW ceiling (mm_sweep) and
+# the former LE64 hand-picks regressed 4k e2e (5897 vs splitk-only 6027).
+# Default off; set FLAGGEMS_ILUVATAR_MM_SKINNY=1 for small-batch decode.
 # Keyed by (N, K); values are (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, warps, stages).
 _SKINNY_MM_LE32 = {
     (2560, 2048): (64, 128, 64, 1, 8, 2),  # qkv
@@ -227,26 +230,17 @@ _SKINNY_MM_LE32 = {
     (12288, 2048): (32, 256, 64, 1, 8, 1),  # gate_up
     (2048, 6144): (32, 64, 128, 1, 8, 2),  # down
 }
-_SKINNY_MM_LE64 = {
-    (2560, 2048): (64, 64, 64, 1, 4, 2),
-    (2048, 2048): (32, 64, 64, 1, 4, 1),
-    (12288, 2048): (64, 64, 64, 1, 8, 2),
-    (2048, 6144): (64, 64, 128, 1, 8, 2),
-}
 _SKINNY_MM_JIT = None
 
 
 def _skinny_mm_enabled() -> bool:
-    return os.getenv("FLAGGEMS_ILUVATAR_MM_SKINNY", "1") != "0"
+    return os.getenv("FLAGGEMS_ILUVATAR_MM_SKINNY", "0") == "1"
 
 
 def _pick_skinny_mm_cfg(M: int, N: int, K: int):
-    if not _skinny_mm_enabled() or M > 64:
+    if not _skinny_mm_enabled() or M > 32:
         return None
-    key = (N, K)
-    if M <= 32:
-        return _SKINNY_MM_LE32.get(key)
-    return _SKINNY_MM_LE64.get(key)
+    return _SKINNY_MM_LE32.get((N, K))
 
 
 def _mm_jit():
