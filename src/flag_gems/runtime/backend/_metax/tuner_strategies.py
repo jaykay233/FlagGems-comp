@@ -43,6 +43,7 @@ what ``align32`` already does within its 32-wide windows.
 """
 
 import math
+import os
 from typing import Union
 
 from flag_gems.utils.libentry import LibTuner
@@ -53,6 +54,14 @@ from flag_gems.utils.libentry import LibTuner
 # the long prefill tail.
 ALIGN32_GEOMETRIC_THRESHOLD = 128
 
+# Hard ceiling for the geometric key. With MetaX MBT raised to 4096 the next
+# power-of-two would keep growing if MBT climbed further; fold everything at
+# or above this cap into one bucket so autotune cost stays O(log MBT).
+# Override with FLAG_GEMS_METAX_ALIGN32_GEOMETRIC_CAP; 0 disables the cap.
+ALIGN32_GEOMETRIC_CAP = int(
+    os.environ.get("FLAG_GEMS_METAX_ALIGN32_GEOMETRIC_CAP", "4096")
+)
+
 
 def align32_geometric(key: Union[int, float]) -> int:
     """Bounded variant of ``align32`` for runtime-varying dimensions.
@@ -61,12 +70,15 @@ def align32_geometric(key: Union[int, float]) -> int:
     * ``key < 32``        -> next power of two (same as ``align32``)
     * ``32 <= key <= T``  -> round up to a multiple of 32 (same as ``align32``)
     * ``key > T``         -> next power of two (bounds the key space)
+    * ``key >= CAP``      -> CAP (when CAP > 0)
 
     >>> [align32_geometric(k) for k in (1, 33, 100, 128, 1500, 2048)]
     [1, 64, 128, 128, 2048, 2048]
     """
     if key == 0:
         return 0
+    if ALIGN32_GEOMETRIC_CAP > 0 and key >= ALIGN32_GEOMETRIC_CAP:
+        return ALIGN32_GEOMETRIC_CAP
     if key < 32:
         return 2 ** math.ceil(math.log2(key))
     if key <= ALIGN32_GEOMETRIC_THRESHOLD:
