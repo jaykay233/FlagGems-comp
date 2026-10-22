@@ -54,12 +54,12 @@ from flag_gems.utils.libentry import LibTuner
 # the long prefill tail.
 ALIGN32_GEOMETRIC_THRESHOLD = 128
 
-# Hard ceiling for the geometric key. With MetaX MBT raised to 4096 the next
-# power-of-two would keep growing if MBT climbed further; fold everything at
-# or above this cap into one bucket so autotune cost stays O(log MBT).
-# Override with FLAG_GEMS_METAX_ALIGN32_GEOMETRIC_CAP; 0 disables the cap.
+# Hard ceiling for the geometric key. Fold everything at or above this cap
+# into one bucket so autotune cost stays O(log MBT). Default tracks the
+# MetaX OpenAI-API MBT default (8192). Override with
+# FLAG_GEMS_METAX_ALIGN32_GEOMETRIC_CAP; 0 disables the cap.
 ALIGN32_GEOMETRIC_CAP = int(
-    os.environ.get("FLAG_GEMS_METAX_ALIGN32_GEOMETRIC_CAP", "4096")
+    os.environ.get("FLAG_GEMS_METAX_ALIGN32_GEOMETRIC_CAP", "8192")
 )
 
 
