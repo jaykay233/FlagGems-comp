@@ -46,6 +46,8 @@ _STATS = {
     "split_unsafe_skip": 0,
     "decode_splitk": 0,
     "split_splitk": 0,
+    "decode_fa_pad": 0,
+    "split_fa_pad": 0,
     "spec_mtp": 0,
     "unsupported": 0,
     "layout": 0,
@@ -60,6 +62,8 @@ _logged_first = {
     "decode_unsafe_skip": False,
     "decode_splitk": False,
     "split_splitk": False,
+    "decode_fa_pad": False,
+    "split_fa_pad": False,
     "split": False,
     "split_unsafe_skip": False,
     "spec_mtp": False,
@@ -85,12 +89,148 @@ def _split_enabled() -> bool:
 # capture call would see the long KV and be refused.
 _DECODE_MIN_BATCH = 32
 _DECODE_UNSAFE_CTX = 2048
+# flashinfer is correct at batch>=32.  For 10<=n<32, padding q/bt/sk to 32
+# recovers the fast correct kernel and beats split-K on long ctx (n=30/16k:
+# ~0.81 ms vs ~1.68 ms).  Below PAD_MIN, split-K is still faster.  Eager only:
+# CUDA-graph capture sizes stay on split-K to avoid dynamic pad buffers in
+# the graph.  Override: VLLM_FL_ILUVATAR_DECODE_FA_PAD=0 / _PAD_MIN.
+_DECODE_FA_PAD_MIN = 10
+_FA_PAD_WS: dict = {}
+# Bumped in set_batch_split so a reused block_table buffer with mutated
+# contents cannot keep stale padded pages across steps.  Within a step the
+# cache keys on data_ptr+shape (not id()) because the split path passes a
+# fresh ``block_table[:n_dec]`` view every layer.
+_FA_PAD_GEN = 0
 
 
 def _decode_is_unsafe(batch: int, max_seqlen_k: int) -> bool:
     """Both arguments are host-side already, so this costs no sync."""
     return batch < _DECODE_MIN_BATCH and max_seqlen_k >= _DECODE_UNSAFE_CTX
 
+
+def _fa_pad_enabled() -> bool:
+    return os.getenv("VLLM_FL_ILUVATAR_DECODE_FA_PAD", "1") != "0"
+
+
+def _fa_pad_min() -> int:
+    raw = os.getenv("VLLM_FL_ILUVATAR_DECODE_FA_PAD_MIN")
+    if raw is None:
+        return _DECODE_FA_PAD_MIN
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _DECODE_FA_PAD_MIN
+
+
+def _should_fa_pad(batch: int, max_seqlen_k: int) -> bool:
+    """Pad-to-32 FA instead of split-K for mid-size unsafe decode batches."""
+    if not _fa_pad_enabled():
+        return False
+    if not _decode_is_unsafe(batch, max_seqlen_k):
+        return False
+    if batch < _fa_pad_min():
+        return False
+    # Avoid allocating / reshaping pad buffers inside a CUDA graph capture.
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    return True
+
+
+def _paged_attention_decode_padded(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    softmax_scale: float,
+    max_seqlen_k: int,
+) -> None:
+    """Run flashinfer decode at batch=_DECODE_MIN_BATCH, write back ``out``[:n].
+
+    Within a step, ``block_table`` / ``seqused_k`` are stable across layers, so
+    padded bt/sk and flashinfer page metadata are built once and reused.  Only
+    ``query`` (and the result slice) are copied per layer — the previous
+    per-layer ``_build_flashinfer_pages`` scatter was what erased the microbench
+    win in e2e (§17.37).
+
+    Cache key uses ``data_ptr``+shape (not ``id``): the split path passes a
+    fresh ``block_table[:n_dec]`` view every layer, which shares storage with
+    the parent.  ``_FA_PAD_GEN`` (bumped in ``set_batch_split``) invalidates
+    across steps so in-place KV-table updates cannot reuse stale pages.
+    """
+    from .paged_attention_decode import _build_flashinfer_pages
+
+    n = int(query.shape[0])
+    target = _DECODE_MIN_BATCH
+    assert 0 < n < target
+    device = query.device
+    n_heads, head_dim = int(query.shape[1]), int(query.shape[2])
+    max_pages = int(block_table.shape[1])
+    page_size = int(key_cache.shape[1])
+    key = (device, target, n_heads, head_dim, query.dtype, block_table.dtype)
+    ws = _FA_PAD_WS.get(key)
+    if ws is None or ws["bt"].shape[1] < max_pages:
+        ws = {
+            "q": torch.zeros(
+                target, n_heads, head_dim, device=device, dtype=query.dtype
+            ),
+            "out": torch.empty(
+                target, n_heads, head_dim, device=device, dtype=query.dtype
+            ),
+            "bt": torch.zeros(
+                target, max_pages, device=device, dtype=block_table.dtype
+            ),
+            "sk": torch.zeros(target, device=device, dtype=seqused_k.dtype),
+            "gen": -1,
+            "meta_key": None,
+            "pages": None,
+        }
+        _FA_PAD_WS[key] = ws
+    q_p, out_p, bt_p, sk_p = ws["q"], ws["out"], ws["bt"], ws["sk"]
+    if bt_p.shape[1] != max_pages:
+        bt_p = torch.zeros(
+            target, max_pages, device=device, dtype=block_table.dtype
+        )
+        ws["bt"] = bt_p
+        ws["gen"] = -1
+        ws["pages"] = None
+
+    # Prefix slices share data_ptr with the parent contiguous table.
+    meta_key = (
+        block_table.data_ptr(),
+        tuple(block_table.shape),
+        seqused_k.data_ptr(),
+        tuple(seqused_k.shape),
+        n,
+    )
+    if (
+        ws["gen"] != _FA_PAD_GEN
+        or ws["meta_key"] != meta_key
+        or ws["pages"] is None
+    ):
+        bt_p[:n].copy_(block_table)
+        bt_p[n:].copy_(block_table[-1:].expand(target - n, -1))
+        sk_p[:n].copy_(seqused_k)
+        sk_p[n:].copy_(seqused_k[-1:].expand(target - n))
+        q_p[n:].zero_()
+        ws["pages"] = _build_flashinfer_pages(bt_p, sk_p, page_size)
+        ws["gen"] = _FA_PAD_GEN
+        ws["meta_key"] = meta_key
+
+    q_p[:n].copy_(query)
+    paged_attention_decode(
+        out=out_p,
+        query=q_p,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=bt_p,
+        seqused_k=sk_p,
+        softmax_scale=softmax_scale,
+        max_seqlen_k=max_seqlen_k,
+        pages=ws["pages"],
+    )
+    out.copy_(out_p[:n])
 
 def _splitk_enabled() -> bool:
     return os.getenv("VLLM_FL_ILUVATAR_SPLITK_DECODE", "1") != "0"
@@ -167,9 +307,13 @@ def set_batch_split(
     _BATCH_SPLIT["batch"] = int(batch)
     _GRAPH_PAGES["key"] = None
     _GRAPH_PAGES["pages"] = None
+    global _FA_PAD_GEN
+    _FA_PAD_GEN += 1
 
 
 def clear_batch_split() -> None:
+    global _FA_PAD_GEN
+    _FA_PAD_GEN += 1
     _GRAPH_PAGES["key"] = None
     _GRAPH_PAGES["pages"] = None
     _BATCH_SPLIT["num_decodes"] = -1
@@ -655,10 +799,26 @@ def try_ixformer_unified_attention(
 
     # Decode: every sequence has q_len == 1.
     if int(max_seqlen_q) == 1:
-        if _decode_is_unsafe(int(block_table.shape[0]), int(max_seqlen_k)):
-            # flashinfer is out, and Triton walks the whole context in one
-            # program per (sequence, KV head) -- exactly the shape the split-K
-            # kernel exists for (§17.16.6).
+        n_batch = int(block_table.shape[0])
+        if _decode_is_unsafe(n_batch, int(max_seqlen_k)):
+            # flashinfer is wrong for n<32 (collapses onto seq0 KV).  Prefer
+            # pad-to-32 FA when it beats split-K (n>=PAD_MIN); else split-K.
+            if _should_fa_pad(n_batch, int(max_seqlen_k)):
+                _STATS["decode_fa_pad"] += 1
+                _log_dispatch(
+                    "decode_fa_pad", q, k, reason=f"pad_{n_batch}_to_{_DECODE_MIN_BATCH}"
+                )
+                _paged_attention_decode_padded(
+                    out=out,
+                    query=q,
+                    key_cache=k,
+                    value_cache=v,
+                    block_table=block_table,
+                    seqused_k=seqused_k,
+                    softmax_scale=softmax_scale,
+                    max_seqlen_k=int(max_seqlen_k),
+                )
+                return True
             if _splitk_enabled() and _splitk_is_usable(q, k, out):
                 _STATS["decode_splitk"] += 1
                 _log_dispatch("decode_splitk", q, k, reason="small_batch_long_ctx")
@@ -748,20 +908,42 @@ def try_ixformer_unified_attention(
         # batch, so it can fall into the flashinfer corner even when the batch
         # does not -- in which case the decode rows go to split-K instead.
         decode_unsafe = _decode_is_unsafe(n_dec, int(max_seqlen_k))
-        use_splitk = decode_unsafe and _splitk_enabled() and _splitk_is_usable(q, k, out)
-        if decode_unsafe and not use_splitk:
+        use_fa_pad = decode_unsafe and _should_fa_pad(n_dec, int(max_seqlen_k))
+        use_splitk = (
+            decode_unsafe
+            and not use_fa_pad
+            and _splitk_enabled()
+            and _splitk_is_usable(q, k, out)
+        )
+        if decode_unsafe and not use_fa_pad and not use_splitk:
             _STATS["split_unsafe_skip"] += 1
             _log_dispatch(
                 "split_unsafe_skip", q, k, reason="decode_slice_below_min_batch"
             )
             return False
-        stat = "split_splitk" if use_splitk else "split"
+        if use_fa_pad:
+            stat = "split_fa_pad"
+        elif use_splitk:
+            stat = "split_splitk"
+        else:
+            stat = "split"
         _STATS[stat] += 1
         _log_dispatch(stat, q, k, reason=f"decode={n_dec} prefill={batch - n_dec}")
         cu_q_pref = _BATCH_SPLIT["prefill_cu_q"]
         if cu_q_pref is None:
             cu_q_pref = cu_seqlens_q[n_dec:] - cu_seqlens_q[n_dec]
-        if use_splitk:
+        if use_fa_pad:
+            _paged_attention_decode_padded(
+                out=out[:n_dec_tok],
+                query=q[:n_dec_tok],
+                key_cache=k,
+                value_cache=v,
+                block_table=block_table[:n_dec],
+                seqused_k=seqused_k[:n_dec],
+                softmax_scale=softmax_scale,
+                max_seqlen_k=int(max_seqlen_k),
+            )
+        elif use_splitk:
             paged_decode_splitk(
                 out=out[:n_dec_tok],
                 query=q[:n_dec_tok],
