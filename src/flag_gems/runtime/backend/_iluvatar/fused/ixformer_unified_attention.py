@@ -94,7 +94,9 @@ _DECODE_UNSAFE_CTX = 2048
 # ~0.81 ms vs ~1.68 ms).  Below PAD_MIN, split-K is still faster.  Eager only:
 # CUDA-graph capture sizes stay on split-K to avoid dynamic pad buffers in
 # the graph.  Override: VLLM_FL_ILUVATAR_DECODE_FA_PAD=0 / _PAD_MIN.
-_DECODE_FA_PAD_MIN = 10
+# With sk=0 pad rows (flashinfer skips empty slots) PAD beats splitk from
+# n≈6 @4k/16k; was 10 when pad rows repeated the last seq's full KV.
+_DECODE_FA_PAD_MIN = 6
 _FA_PAD_WS: dict = {}
 # Bumped in set_batch_split so a reused block_table buffer with mutated
 # contents cannot keep stale padded pages across steps.  Within a step the
@@ -209,10 +211,14 @@ def _paged_attention_decode_padded(
         or ws["meta_key"] != meta_key
         or ws["pages"] is None
     ):
+        # Real rows first; pad rows keep sk=0 / bt=0 so flashinfer skips their
+        # KV walk.  Repeating the last seq (old behaviour) forced full-length
+        # scans on the pad slots: 0.63 ms -> 0.43 ms at n=10 @16k, which is what
+        # moved the crossover down to n>=6 (FINDINGS-iluvatar §17.37.5).
+        bt_p.zero_()
+        sk_p.zero_()
         bt_p[:n].copy_(block_table)
-        bt_p[n:].copy_(block_table[-1:].expand(target - n, -1))
         sk_p[:n].copy_(seqused_k)
-        sk_p[n:].copy_(seqused_k[-1:].expand(target - n))
         q_p[n:].zero_()
         ws["pages"] = _build_flashinfer_pages(bt_p, sk_p, page_size)
         ws["gen"] = _FA_PAD_GEN
