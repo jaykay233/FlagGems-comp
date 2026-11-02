@@ -124,8 +124,26 @@ def _fa_pad_min() -> int:
         return _DECODE_FA_PAD_MIN
 
 
+def _fa_pad_target() -> int:
+    """Launch batch for the padded FA path.
+
+    Default equals ``_DECODE_MIN_BATCH`` (32): the smallest size at which the
+    vendor flashinfer decode kernel is correct.  Override with
+    ``VLLM_FL_ILUVATAR_DECODE_FA_PAD_TARGET`` (must be >= 32) to experiment with
+    higher occupancy at 16k's live batch of ~29 — pad rows still carry
+    ``seqused_k=0`` so they add no KV traffic.  Values below 32 are clamped.
+    """
+    raw = os.getenv("VLLM_FL_ILUVATAR_DECODE_FA_PAD_TARGET")
+    if raw is None:
+        return _DECODE_MIN_BATCH
+    try:
+        return max(_DECODE_MIN_BATCH, int(raw))
+    except ValueError:
+        return _DECODE_MIN_BATCH
+
+
 def _should_fa_pad(batch: int, max_seqlen_k: int) -> bool:
-    """Pad-to-32 FA instead of split-K for mid-size unsafe decode batches."""
+    """Pad-to-target FA instead of split-K for mid-size unsafe decode batches."""
     if not _fa_pad_enabled():
         return False
     if not _decode_is_unsafe(batch, max_seqlen_k):
@@ -148,7 +166,7 @@ def _paged_attention_decode_padded(
     softmax_scale: float,
     max_seqlen_k: int,
 ) -> None:
-    """Run flashinfer decode at batch=_DECODE_MIN_BATCH, write back ``out``[:n].
+    """Run flashinfer decode at ``_fa_pad_target()``, write back ``out``[:n].
 
     Within a step, ``block_table`` / ``seqused_k`` are stable across layers, so
     padded bt/sk and flashinfer page metadata are built once and reused.  Only
@@ -164,7 +182,7 @@ def _paged_attention_decode_padded(
     from .paged_attention_decode import _build_flashinfer_pages
 
     n = int(query.shape[0])
-    target = _DECODE_MIN_BATCH
+    target = _fa_pad_target()
     assert 0 < n < target
     device = query.device
     n_heads, head_dim = int(query.shape[1]), int(query.shape[2])

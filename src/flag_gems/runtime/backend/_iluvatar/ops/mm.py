@@ -222,7 +222,8 @@ def mm_kernel(
 # ~1.2–1.8× on MiniCPM5-2B's four layer GEMMs at M≤32.
 # M>32 falls through: M=64 is already ~80–90% of BW ceiling (mm_sweep) and
 # the former LE64 hand-picks regressed 4k e2e (5897 vs splitk-only 6027).
-# Default off; set FLAGGEMS_ILUVATAR_MM_SKINNY=1 for small-batch decode.
+# Default on (LE32 only; M>32 falls through). Set FLAGGEMS_ILUVATAR_MM_SKINNY=0 to disable.
+# §17.44: 16k +49 tok/s; 4k neutral. Was off after LE64 regression (§17.35).
 # Keyed by (N, K); values are (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, warps, stages).
 _SKINNY_MM_LE32 = {
     (2560, 2048): (64, 128, 64, 1, 8, 2),  # qkv
@@ -234,7 +235,7 @@ _SKINNY_MM_JIT = None
 
 
 def _skinny_mm_enabled() -> bool:
-    return os.getenv("FLAGGEMS_ILUVATAR_MM_SKINNY", "0") == "1"
+    return os.getenv("FLAGGEMS_ILUVATAR_MM_SKINNY", "1") != "0"
 
 
 def _pick_skinny_mm_cfg(M: int, N: int, K: int):
