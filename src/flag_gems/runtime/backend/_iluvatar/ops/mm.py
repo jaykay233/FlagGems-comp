@@ -231,6 +231,49 @@ _SKINNY_MM_LE32 = {
     (12288, 2048): (32, 256, 64, 1, 8, 1),  # gate_up
     (2048, 6144): (32, 64, 128, 1, 8, 2),  # down
 }
+# 33 < M <= 64 hand-picks (2026-11-03).
+#
+# Only two of the four layer GEMMs are overridden.  The 4k decode batch lives in
+# this M range and the LibTuner path is weak on the two small shapes, but it is
+# already good on the two big ones, and forcing those was what caused an earlier
+# regression (below).
+#
+# Measured inside a CUDA graph (42 replays = one layer, i.e. what production
+# pays under FULL_DECODE_ONLY), averaged over M = 33/40/48/56/64:
+#
+#   shape      tuner      forced     gain      x42 layers
+#   qkv       27.9 us    20.8 us    +25%      0.31 ms/step
+#   o         18.8 us    14.6 us    +22%      0.18 ms/step
+#   gate_up   92.0 us    -          tuner wins (546 GB/s = 93% of peak)
+#   down      54.8 us    -          tuner wins
+#
+# qkv and o together are ~0.48 ms off a 35.8 ms 4k decode step (1.35%).
+#
+# e2e 4k, same session and server flags, only this env var flipping, 3 runs per
+# arm:  off 6010.30 / 6022.77 / 6023.97  (mean 6019.01, sd 7.57)
+#       on  6031.99 / 6048.16 / 6055.38  (mean 6045.18, sd 11.98)
+# The arms do not overlap (on_min - off_max = +8.02), Welch t = 3.2, so
+# +26.16 tok/s (+0.43%) is real -- but it is only ~1/3 of the 1.35% step-time
+# win, the rest being absorbed by other fixed cost in the step.  An earlier
+# 2-run A/B agrees in sign and size: +22.04 tok/s (+0.37%) pooled 5 vs 5.
+#
+# Both are BLOCK_M=64 so the weight tile is a single DRAM pass, and both keep
+# num_stages=2.  o needs num_warps=8: the 4-warp variant is 3% slower in a graph
+# even though it looks fine in eager timing.
+#
+# HISTORY OF THIS CONSTANT -- do not repeat:
+#   An earlier version of this dict also forced gate_up (64,128,64,1,8,2) and
+#   down (64,64,128,1,4,2), and regressed 4k e2e to 5895.22 tok/s
+#   (6010.10/6028.91 baseline, -2.1%).  gate_up forced that way costs 112.5 us
+#   vs the tuner's 92.0 us.  The same magnitude as the 2026-10-21 attempt in
+#   §17.35 (5897 vs 6027).
+#   The root error was benchmarking against _SKINNY_MM_LE32, which is gated to
+#   M<=32 and never runs at M=64; the real baseline is mm_kernel's tuner.
+#   Set FLAGGEMS_ILUVATAR_MM_SKINNY_LE64=0 to disable.
+_SKINNY_MM_LE64 = {
+    (2560, 2048): (64, 128, 64, 1, 8, 2),  # qkv
+    (2048, 2048): (64, 64, 128, 1, 8, 2),  # o_proj
+}
 _SKINNY_MM_JIT = None
 
 
@@ -238,10 +281,20 @@ def _skinny_mm_enabled() -> bool:
     return os.getenv("FLAGGEMS_ILUVATAR_MM_SKINNY", "1") != "0"
 
 
+def _skinny_mm_le64_enabled() -> bool:
+    # On by default: +26.16 tok/s (+0.43%) at 4k, see the table at
+    # _SKINNY_MM_LE64.  FLAGGEMS_ILUVATAR_MM_SKINNY_LE64=0 disables.
+    return os.getenv("FLAGGEMS_ILUVATAR_MM_SKINNY_LE64", "1") != "0"
+
+
 def _pick_skinny_mm_cfg(M: int, N: int, K: int):
-    if not _skinny_mm_enabled() or M > 32:
+    if not _skinny_mm_enabled():
         return None
-    return _SKINNY_MM_LE32.get((N, K))
+    if M <= 32:
+        return _SKINNY_MM_LE32.get((N, K))
+    if M <= 64 and _skinny_mm_le64_enabled():
+        return _SKINNY_MM_LE64.get((N, K))
+    return None
 
 
 def _mm_jit():
