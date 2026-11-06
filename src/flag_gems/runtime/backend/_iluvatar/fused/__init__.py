@@ -25,6 +25,8 @@ from .ixformer_unified_attention import (
 from .matmul_bias_activation import matmul_bias_activation
 from .paged_attention_decode import paged_attention_decode
 from .paged_decode_splitk import paged_decode_splitk
+from .paged_decode_triton import paged_decode_triton
+from .silu_and_mul import silu_and_mul, silu_and_mul_out
 from .sparse_attention import sparse_attn_triton
 from .top_k_per_row_prefill import top_k_per_row_prefill
 
@@ -40,6 +42,9 @@ __all__ = [
     "matmul_bias_activation",
     "paged_attention_decode",
     "paged_decode_splitk",
+    "paged_decode_triton",
+    "silu_and_mul",
+    "silu_and_mul_out",
     "sparse_attn_triton",
     "top_k_per_row_prefill",
 ]

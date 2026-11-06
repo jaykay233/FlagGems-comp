@@ -29,6 +29,7 @@ import torch
 from .flash_attn_prefill import flash_attn_prefill
 from .paged_attention_decode import paged_attention_decode, paged_attention_mtp
 from .paged_decode_splitk import paged_decode_splitk
+from .paged_decode_triton import paged_decode_triton
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ _STATS = {
     "split_splitk": 0,
     "decode_fa_pad": 0,
     "split_fa_pad": 0,
+    "decode_triton": 0,
     "spec_mtp": 0,
     "unsupported": 0,
     "layout": 0,
@@ -258,6 +260,40 @@ def _paged_attention_decode_padded(
 
 def _splitk_enabled() -> bool:
     return os.getenv("VLLM_FL_ILUVATAR_SPLITK_DECODE", "1") != "0"
+
+
+# The Triton flash-decoding backend is vendor-free and, measured dispatch to
+# dispatch (same Python entry, only the backend body differs), wins for
+# mid-size batches at short-to-medium context and loses on long context,
+# where pad-to-32 FA is already running at 641 GB/s:
+#
+#   ctx 4600:  n=32 1.24x  n=64 1.07x  n=128 1.00x
+#   ctx 17408: n=32 0.97x  n=64 0.92x
+#
+# n<32 is excluded because the vendor path there is pad-to-32 FA, which is
+# faster than both (4k/n=29: 0.244 ms vs our 0.281 ms).  The upper bound is
+# 144 rather than 64 on purpose: under FULL_DECODE_ONLY the batch a kernel sees
+# is the *padded* capture size, so a 64-request step runs with n_batch=72 and a
+# 64 cap made most of the scored 4k steps fall back to the vendor path.
+#
+# Default ON (§17.58–17.59 + 4k e2e A/B 2026-11-06): BNDH row-major matches
+# warm FA (~488µs); e2e Total tok/s Triton ≈ FA (6226 vs 6122, no regression).
+# =0 falls back to vendor FA; =auto uses the shape gate below.
+def _triton_decode_mode() -> str:
+    return os.getenv("VLLM_FL_ILUVATAR_DECODE_TRITON", "1").strip().lower()
+
+
+def _triton_decode_enabled() -> bool:
+    return _triton_decode_mode() not in ("0", "off", "false", "no")
+
+
+def _triton_decode_wanted(n_batch: int, max_seqlen_k: int) -> bool:
+    mode = _triton_decode_mode()
+    if mode in ("0", "off", "false", "no"):
+        return False
+    if mode in ("1", "on", "true", "yes"):
+        return True
+    return 32 <= n_batch <= 144 and max_seqlen_k <= 8192
 
 
 def _splitk_is_usable(q: torch.Tensor, k: torch.Tensor, out: torch.Tensor) -> bool:
@@ -824,6 +860,23 @@ def try_ixformer_unified_attention(
     # Decode: every sequence has q_len == 1.
     if int(max_seqlen_q) == 1:
         n_batch = int(block_table.shape[0])
+        if _triton_decode_wanted(n_batch, int(max_seqlen_k)):
+            # Drop-in replacement for the whole decode branch below, inside the
+            # shapes the Triton kernel measurably wins.  It returns False (no
+            # side effects) when the shape or the workspace is unusable, so the
+            # vendor path remains the fallback.
+            if paged_decode_triton(
+                out=out,
+                query=q,
+                key_cache=k,
+                value_cache=v,
+                block_table=block_table,
+                seqused_k=seqused_k,
+                softmax_scale=softmax_scale,
+            ):
+                _STATS["decode_triton"] += 1
+                _log_dispatch("decode_triton", q, k, reason="triton_flashdecoding")
+                return True
         if _decode_is_unsafe(n_batch, int(max_seqlen_k)):
             # flashinfer is wrong for n<32 (collapses onto seq0 KV).  Prefer
             # pad-to-32 FA when it beats split-K (n>=PAD_MIN); else split-K.
