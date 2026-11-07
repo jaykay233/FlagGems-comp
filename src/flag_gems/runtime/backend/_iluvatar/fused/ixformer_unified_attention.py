@@ -48,6 +48,7 @@ _STATS = {
     "decode_splitk": 0,
     "split_splitk": 0,
     "decode_fa_pad": 0,
+    "decode_ivcore": 0,
     "split_fa_pad": 0,
     "decode_triton": 0,
     "spec_mtp": 0,
@@ -860,6 +861,26 @@ def try_ixformer_unified_attention(
     # Decode: every sequence has q_len == 1.
     if int(max_seqlen_q) == 1:
         n_batch = int(block_table.shape[0])
+        # Opt-in ivcore u8 decode (hi-K + INT8-V). Env VLLM_FL_ILUVATAR_IVCORE_DECODE=1.
+        try:
+            from vllm_fl.dispatch.backends.vendor.iluvatar.ivcore_u8_decode import (
+                enabled as _ivcore_on,
+                paged_decode_ivcore,
+            )
+            if _ivcore_on() and paged_decode_ivcore(
+                out=out,
+                query=q,
+                key_cache=k,
+                value_cache=v,
+                block_table=block_table,
+                seqused_k=seqused_k,
+                softmax_scale=softmax_scale,
+            ):
+                _STATS["decode_ivcore"] += 1
+                _log_dispatch("decode_ivcore", q, k, reason="ivcore_u8_int8v")
+                return True
+        except Exception:
+            pass
         if _triton_decode_wanted(n_batch, int(max_seqlen_k)):
             # Drop-in replacement for the whole decode branch below, inside the
             # shapes the Triton kernel measurably wins.  It returns False (no
