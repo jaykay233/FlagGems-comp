@@ -288,9 +288,27 @@ def usable(q: torch.Tensor, k: torch.Tensor, out: torch.Tensor) -> bool:
 
 
 def _pick_split(batch: int, n_kv: int, max_pages: int) -> int:
-    split = _SPLIT_MIN
-    want = -(-_CTA_TARGET // max(1, batch * n_kv))
-    while split < want and split < _SPLIT_MAX:
+    """Largest power-of-two split whose grid still fits in ``_CTA_TARGET``.
+
+    Rounding *up* to ``_CTA_TARGET`` overshoots by one doubling: measured on
+    BI-V150, the CTAs the kernel actually wants is the largest grid *under*
+    the target, because the split also divides the pages each CTA walks and
+    the per-CTA page run is what keeps the KV loads coalesced.
+
+    Swept over batch/ctx on BI-V150 (median of 40, warps=1/stages=1). The old
+    round-up rule lost 3.4-5.7% at every operating point except where it
+    happened to already land on the floor:
+
+        n=27/28 ctx=16384   s8 -> s4   1.041x / 1.043x
+        n=30    ctx=16384   s8 -> s4   1.034x
+        n=24/25 ctx=16384   s8 -> s4   1.057x / 1.050x
+        n=40/48 ctx=16384   s4 -> s2   1.046x / 1.050x
+        n=80..102 ctx=4096  s2 -> s1   1.035x .. 1.044x
+        n=64    ctx=4096    s2 -> s2   (tie, 614 GB/s)
+    """
+    base = max(1, batch * n_kv)
+    split = 1
+    while split * 2 <= _SPLIT_MAX and split * 2 * base <= _CTA_TARGET:
         split *= 2
     while split > 1 and max_pages // split < _MIN_PAGES_PER_SPLIT:
         split //= 2
@@ -335,6 +353,13 @@ def paged_decode_triton(
     group = n_qo // n_kv
     bm = max(4, triton.next_power_of_2(group))
     split = _pick_split(batch, n_kv, int(block_table.shape[1]))
+    if os.getenv("VLLM_FL_ILUVATAR_DECODE_SPLIT_DEBUG"):
+        _KEY_SEEN = globals().setdefault("_KEY_SEEN", set())
+        k = (batch, n_kv, int(block_table.shape[1]), split)
+        if k not in _KEY_SEEN:
+            _KEY_SEEN.add(k)
+            print(f"[split-debug] batch={batch} n_kv={n_kv} "
+                  f"max_pages={int(block_table.shape[1])} split={split}", flush=True)
 
     ws = _workspace(split, batch, n_qo, head_dim, query.dtype, query.device)
     if ws is None:
@@ -359,6 +384,19 @@ def paged_decode_triton(
         o_buf = out.view(1, *out.shape)
         l_buf = l_buf[:, :, :1]
 
+    # Launch knobs (env override for sweeps). Both layouts measure best at
+    # warps=1 / stages=1 on BI-V150; stages≥2 regresses (~+5–13%).
+    def _launch_int(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return default
+
+    warps = _launch_int("VLLM_FL_ILUVATAR_DECODE_TRITON_WARPS", 1)
+    stages = _launch_int("VLLM_FL_ILUVATAR_DECODE_TRITON_STAGES", 1)
     if kind == "hd_major":
         _paged_decode_kernel_k_contig[(batch * n_kv * split,)](
             query, key_cache, value_cache, bt, sl, o_buf, l_buf,
@@ -368,7 +406,7 @@ def paged_decode_triton(
             bt.stride(0), o_buf.stride(0), scale,
             N_QO=n_qo, N_KV=n_kv, HD=head_dim, PAGE=page, BM=bm, GROUP=group,
             SPLIT=split, OUT_DTYPE=out_dtype,
-            num_warps=1, num_stages=1,
+            num_warps=warps, num_stages=stages,
         )
     else:
         _paged_decode_kernel[(batch * n_kv * split,)](
@@ -379,7 +417,7 @@ def paged_decode_triton(
             bt.stride(0), o_buf.stride(0), scale,
             N_QO=n_qo, N_KV=n_kv, HD=head_dim, PAGE=page, BM=bm, GROUP=group,
             SPLIT=split, OUT_DTYPE=out_dtype,
-            num_warps=1, num_stages=1,
+            num_warps=warps, num_stages=stages,
         )
     if split > 1:
         _paged_decode_combine[(batch * n_qo,)](
