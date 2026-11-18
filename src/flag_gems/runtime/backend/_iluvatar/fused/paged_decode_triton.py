@@ -46,7 +46,30 @@ import triton.language as tl
 # Programs per (sequence, kv_head) are chosen so the grid covers all 16 SMs
 # with enough CTAs to hide latency; past ~256 CTAs a wider split only adds
 # combine traffic.
+#
+# On a 16-SM part the CTA count also sets the wave count, so the tail loss is
+# roughly 1/(CTAs/16).  Raised to 512 the split doubles and the tail loss halves,
+# at the cost of a wider combine pass and half the pages per split.  Which side
+# wins is shape dependent, so keep the target overridable for A/B.
+#
+# Measured: raising it to 512 for the 4k serve shape (batch 64, ctx 4096, so
+# split 2 -> 4 = 512 CTAs) is *worse*, not better: 48.72 ms TPOT vs 46.07 ms,
+# output 1267 vs 1389 tok/s (-8.8%), total 6335.05 vs 6436.06 (-1.6%).  At that
+# point max_pages//split == 8, exactly _MIN_PAGES_PER_SPLIT, so the extra split
+# buys no coalescing headroom and only adds combine traffic.  Keep 256.
 _CTA_TARGET = 256
+
+
+def _cta_target() -> int:
+    raw = os.getenv("VLLM_FL_ILUVATAR_DECODE_CTA_TARGET")
+    if raw is None:
+        return _CTA_TARGET
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _CTA_TARGET
+
+
 _SPLIT_MIN = 2
 _SPLIT_MAX = 16
 # Fewer pages per split than this is pure overhead.
@@ -307,8 +330,9 @@ def _pick_split(batch: int, n_kv: int, max_pages: int) -> int:
         n=64    ctx=4096    s2 -> s2   (tie, 614 GB/s)
     """
     base = max(1, batch * n_kv)
+    target = _cta_target()
     split = 1
-    while split * 2 <= _SPLIT_MAX and split * 2 * base <= _CTA_TARGET:
+    while split * 2 <= _SPLIT_MAX and split * 2 * base <= target:
         split *= 2
     while split > 1 and max_pages // split < _MIN_PAGES_PER_SPLIT:
         split //= 2
