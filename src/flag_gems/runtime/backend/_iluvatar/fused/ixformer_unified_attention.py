@@ -49,7 +49,9 @@ _STATS = {
     "split_splitk": 0,
     "decode_fa_pad": 0,
     "decode_ivcore": 0,
+    "split_ivcore": 0,
     "split_fa_pad": 0,
+    "split_triton": 0,
     "decode_triton": 0,
     "spec_mtp": 0,
     "unsupported": 0,
@@ -67,6 +69,7 @@ _logged_first = {
     "split_splitk": False,
     "decode_fa_pad": False,
     "split_fa_pad": False,
+    "split_triton": False,
     "split": False,
     "split_unsafe_skip": False,
     "spec_mtp": False,
@@ -370,6 +373,18 @@ def set_batch_split(
     _GRAPH_PAGES["pages"] = None
     global _FA_PAD_GEN
     _FA_PAD_GEN += 1
+    # Prefill wrote pages into bf16 KV that the u8 workspace may not have.
+    # Mark stale so the next eager ivcore full-packs (CG already freezes
+    # full-pack, so replay stays correct without last-page).
+    if int(num_q_tokens) > int(num_decode_tokens):
+        try:
+            from vllm_fl.dispatch.backends.vendor.iluvatar.ivcore_u8_decode import (
+                invalidate_pack_full_done,
+            )
+
+            invalidate_pack_full_done()
+        except Exception:
+            pass
 
 
 def clear_batch_split() -> None:
@@ -853,7 +868,27 @@ def try_ixformer_unified_attention(
         _log_dispatch("unsupported", q, k, reason="feature_gate")
         return False
 
-    if not (_hnd_view_is_free(k) and _hnd_view_is_free(v)):
+    # Asymmetric K HD-major (plugin VLLM_FL_ILUVATAR_KV_K_HD_MAJOR): skip the
+    # HND-contig gate — FA cannot consume it; Triton FD auto-picks hd_major.
+    # Do NOT as_strided-remap K before this function: remap makes stride(-1)!=1
+    # and the feature gate above would count every prefill as ``unsupported``.
+    _k_hd = False
+    _k_hd_stride = False
+    try:
+        from vllm_fl.dispatch.backends.vendor.iluvatar.kv_k_hd_major import (
+            enabled as _k_hd_on,
+            is_k_hd_major as _is_k_hd,
+            prefill_stride_enabled as _prefill_stride_on,
+        )
+        _k_hd = bool(_k_hd_on() and _is_k_hd(k, int(q.shape[-1])))
+        _k_hd_stride = bool(_k_hd and _prefill_stride_on())
+    except Exception:
+        _k_hd = False
+        _k_hd_stride = False
+
+    if _k_hd:
+        pass  # decode / mixed handled below with HD-major K
+    elif not (_hnd_view_is_free(k) and _hnd_view_is_free(v)):
         _STATS["layout"] += 1
         _log_dispatch("layout", q, k, reason="hnd_view_not_contiguous")
         return False
@@ -861,7 +896,8 @@ def try_ixformer_unified_attention(
     # Decode: every sequence has q_len == 1.
     if int(max_seqlen_q) == 1:
         n_batch = int(block_table.shape[0])
-        # Opt-in ivcore u8 decode (hi-K + INT8-V). Env VLLM_FL_ILUVATAR_IVCORE_DECODE=1.
+        # Opt-in ivcore u8 decode (INT8-K + INT8-V). Env VLLM_FL_ILUVATAR_IVCORE_DECODE=1.
+        # Supports BNDH and asym K HD-major + V BNDH via ivcore_pack_bt_asym.
         try:
             from vllm_fl.dispatch.backends.vendor.iluvatar.ivcore_u8_decode import (
                 enabled as _ivcore_on,
@@ -877,7 +913,12 @@ def try_ixformer_unified_attention(
                 softmax_scale=softmax_scale,
             ):
                 _STATS["decode_ivcore"] += 1
-                _log_dispatch("decode_ivcore", q, k, reason="ivcore_u8_int8v")
+                _log_dispatch(
+                    "decode_ivcore",
+                    q,
+                    k,
+                    reason="ivcore_u8_asym" if _k_hd else "ivcore_u8_int8v",
+                )
                 return True
         except Exception:
             pass
@@ -896,8 +937,26 @@ def try_ixformer_unified_attention(
                 softmax_scale=softmax_scale,
             ):
                 _STATS["decode_triton"] += 1
-                _log_dispatch("decode_triton", q, k, reason="triton_flashdecoding")
+                _log_dispatch(
+                    "decode_triton",
+                    q,
+                    k,
+                    reason="triton_flashdecoding_hd_major" if _k_hd else "triton_flashdecoding",
+                )
                 return True
+            if _k_hd:
+                # No FA/flashinfer fallback for asymmetric K.
+                _STATS["decode_unsafe_skip"] += 1
+                _log_dispatch(
+                    "decode_unsafe_skip", q, k, reason="k_hd_major_triton_miss"
+                )
+                return False
+        if _k_hd:
+            _STATS["decode_unsafe_skip"] += 1
+            _log_dispatch(
+                "decode_unsafe_skip", q, k, reason="k_hd_major_no_triton"
+            )
+            return False
         if _decode_is_unsafe(n_batch, int(max_seqlen_k)):
             # flashinfer is wrong for n<32 (collapses onto seq0 KV).  Prefer
             # pad-to-32 FA when it beats split-K (n>=PAD_MIN); else split-K.
@@ -959,10 +1018,12 @@ def try_ixformer_unified_attention(
     # sparse across the batch, so cu_seqlens may be mixed q=1/q=2. vLLM's
     # query buffer is frequently a non-contiguous view; ixformer requires
     # contiguous Q/O, so materialize when needed.
+    # Skip on HD-major K: MTP indexes BNDH ``k.shape[2]=n_kv``.
     batch = int(block_table.shape[0])
     num_q_tokens = int(q.shape[0])
     if (
         causal
+        and not _k_hd
         and _spec_mtp_enabled()
         and _short_spec_batch(max_seqlen_q, num_q_tokens, batch)
     ):
@@ -1001,37 +1062,130 @@ def try_ixformer_unified_attention(
     split = _usable_batch_split(num_q_tokens, batch)
     if split is not None and _split_enabled():
         n_dec, n_dec_tok = split
-        # Mixed batches run eager, so unlike pure decode they get no shelter
-        # from graph capture.  The decode slice is also smaller than the whole
-        # batch, so it can fall into the flashinfer corner even when the batch
-        # does not -- in which case the decode rows go to split-K instead.
-        decode_unsafe = _decode_is_unsafe(n_dec, int(max_seqlen_k))
-        use_fa_pad = decode_unsafe and _should_fa_pad(n_dec, int(max_seqlen_k))
-        use_splitk = (
-            decode_unsafe
-            and not use_fa_pad
-            and _splitk_enabled()
-            and _splitk_is_usable(q, k, out)
-        )
-        if decode_unsafe and not use_fa_pad and not use_splitk:
-            _STATS["split_unsafe_skip"] += 1
-            _log_dispatch(
-                "split_unsafe_skip", q, k, reason="decode_slice_below_min_batch"
-            )
-            return False
-        if use_fa_pad:
-            stat = "split_fa_pad"
-        elif use_splitk:
-            stat = "split_splitk"
-        else:
-            stat = "split"
-        _STATS[stat] += 1
-        _log_dispatch(stat, q, k, reason=f"decode={n_dec} prefill={batch - n_dec}")
         cu_q_pref = _BATCH_SPLIT["prefill_cu_q"]
         if cu_q_pref is None:
             cu_q_pref = cu_seqlens_q[n_dec:] - cu_seqlens_q[n_dec]
-        if use_fa_pad:
-            _paged_attention_decode_padded(
+
+        # HD-major K: decode → ivcore; prefill → K transpose→BNDH + FA
+        # (dedicated HD-major prefill kernel parked; bridge copy is OK for now).
+        if _k_hd:
+            dec_ok = False
+            try:
+                from vllm_fl.dispatch.backends.vendor.iluvatar.ivcore_u8_decode import (
+                    enabled as _ivcore_on,
+                    paged_decode_ivcore,
+                )
+                if _ivcore_on() and paged_decode_ivcore(
+                    out=out[:n_dec_tok],
+                    query=q[:n_dec_tok],
+                    key_cache=k,
+                    value_cache=v,
+                    block_table=block_table[:n_dec],
+                    seqused_k=seqused_k[:n_dec],
+                    softmax_scale=softmax_scale,
+                ):
+                    dec_ok = True
+            except Exception:
+                pass
+            if not dec_ok and not (
+                _triton_decode_wanted(n_dec, int(max_seqlen_k))
+                and paged_decode_triton(
+                    out=out[:n_dec_tok],
+                    query=q[:n_dec_tok],
+                    key_cache=k,
+                    value_cache=v,
+                    block_table=block_table[:n_dec],
+                    seqused_k=seqused_k[:n_dec],
+                    softmax_scale=softmax_scale,
+                )
+            ):
+                _STATS["split_unsafe_skip"] += 1
+                _log_dispatch(
+                    "split_unsafe_skip",
+                    q,
+                    k,
+                    reason="k_hd_major_decode_miss",
+                )
+                return False
+            try:
+                from vllm_fl.dispatch.backends.vendor.iluvatar.kv_k_hd_major import (
+                    to_bndh_contig,
+                )
+
+                k_fa = to_bndh_contig(k)
+                flash_attn_prefill(
+                    out=out[n_dec_tok:],
+                    query=q[n_dec_tok:],
+                    key_cache=k_fa,
+                    value_cache=v,
+                    cu_seqlens_q=cu_q_pref,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k[n_dec:],
+                    max_seqlen_k=max_seqlen_k,
+                    block_table=block_table[n_dec:],
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=softcap,
+                    cu_seqlens_k=_BATCH_SPLIT["prefill_cu_k"],
+                )
+            except Exception as e:
+                _STATS["split_unsafe_skip"] += 1
+                _log_dispatch(
+                    "split_unsafe_skip",
+                    q,
+                    k,
+                    reason=f"k_hd_major_prefill_xpose_fa:{type(e).__name__}",
+                )
+                return False
+            _STATS["split"] += 1
+            _log_dispatch(
+                "split",
+                q,
+                k,
+                reason=f"k_hd_major decode+xpose_fa decode={n_dec}",
+            )
+            return True
+
+        # Mixed batches run eager (no CUDA-graph shelter).  Decode-slice order:
+        # 1) ivcore last-page if warm (opt-in; default off)
+        # 2) Triton FD — same backend as pure decode; microbench beats FA/pad/
+        #    splitk on the decode piece for 4k n≈32–64 and most 16k sizes
+        # 3) FA pad / splitk / warm FA fallback
+        # Never full-pack ivcore here (slower than FA on the decode slice).
+        dec_ok = False
+        try:
+            from vllm_fl.dispatch.backends.vendor.iluvatar.ivcore_u8_decode import (
+                enabled as _ivcore_on,
+                last_page_ready as _iv_last_ready,
+                paged_decode_ivcore,
+            )
+
+            if (
+                _ivcore_on()
+                and _iv_last_ready(k)
+                and paged_decode_ivcore(
+                    out=out[:n_dec_tok],
+                    query=q[:n_dec_tok],
+                    key_cache=k,
+                    value_cache=v,
+                    block_table=block_table[:n_dec],
+                    seqused_k=seqused_k[:n_dec],
+                    softmax_scale=softmax_scale,
+                )
+            ):
+                dec_ok = True
+                _STATS["split_ivcore"] = _STATS.get("split_ivcore", 0) + 1
+                _log_dispatch(
+                    "split_ivcore",
+                    q,
+                    k,
+                    reason=f"decode={n_dec} prefill={batch - n_dec}",
+                )
+        except Exception:
+            dec_ok = False
+        if not dec_ok and _triton_decode_wanted(n_dec, int(max_seqlen_k)):
+            if paged_decode_triton(
                 out=out[:n_dec_tok],
                 query=q[:n_dec_tok],
                 key_cache=k,
@@ -1039,30 +1193,71 @@ def try_ixformer_unified_attention(
                 block_table=block_table[:n_dec],
                 seqused_k=seqused_k[:n_dec],
                 softmax_scale=softmax_scale,
-                max_seqlen_k=int(max_seqlen_k),
+            ):
+                dec_ok = True
+                _STATS["split_triton"] = _STATS.get("split_triton", 0) + 1
+                _log_dispatch(
+                    "split_triton",
+                    q,
+                    k,
+                    reason=f"decode={n_dec} prefill={batch - n_dec}",
+                )
+        if not dec_ok:
+            decode_unsafe = _decode_is_unsafe(n_dec, int(max_seqlen_k))
+            use_fa_pad = decode_unsafe and _should_fa_pad(n_dec, int(max_seqlen_k))
+            use_splitk = (
+                decode_unsafe
+                and not use_fa_pad
+                and _splitk_enabled()
+                and _splitk_is_usable(q, k, out)
             )
-        elif use_splitk:
-            paged_decode_splitk(
-                out=out[:n_dec_tok],
-                query=q[:n_dec_tok],
-                key_cache=k,
-                value_cache=v,
-                block_table=block_table[:n_dec],
-                seqused_k=seqused_k[:n_dec],
-                softmax_scale=softmax_scale,
-            )
-        else:
-            paged_attention_decode(
-                out=out[:n_dec_tok],
-                query=q[:n_dec_tok],
-                key_cache=k,
-                value_cache=v,
-                block_table=block_table[:n_dec],
-                seqused_k=seqused_k[:n_dec],
-                softmax_scale=softmax_scale,
-                max_seqlen_k=max_seqlen_k,
-                pages=_cached_decode_pages(n_dec),
-            )
+            if decode_unsafe and not use_fa_pad and not use_splitk:
+                _STATS["split_unsafe_skip"] += 1
+                _log_dispatch(
+                    "split_unsafe_skip", q, k, reason="decode_slice_below_min_batch"
+                )
+                return False
+            if use_fa_pad:
+                stat = "split_fa_pad"
+            elif use_splitk:
+                stat = "split_splitk"
+            else:
+                stat = "split"
+            _STATS[stat] += 1
+            _log_dispatch(stat, q, k, reason=f"decode={n_dec} prefill={batch - n_dec}")
+            if use_fa_pad:
+                _paged_attention_decode_padded(
+                    out=out[:n_dec_tok],
+                    query=q[:n_dec_tok],
+                    key_cache=k,
+                    value_cache=v,
+                    block_table=block_table[:n_dec],
+                    seqused_k=seqused_k[:n_dec],
+                    softmax_scale=softmax_scale,
+                    max_seqlen_k=int(max_seqlen_k),
+                )
+            elif use_splitk:
+                paged_decode_splitk(
+                    out=out[:n_dec_tok],
+                    query=q[:n_dec_tok],
+                    key_cache=k,
+                    value_cache=v,
+                    block_table=block_table[:n_dec],
+                    seqused_k=seqused_k[:n_dec],
+                    softmax_scale=softmax_scale,
+                )
+            else:
+                paged_attention_decode(
+                    out=out[:n_dec_tok],
+                    query=q[:n_dec_tok],
+                    key_cache=k,
+                    value_cache=v,
+                    block_table=block_table[:n_dec],
+                    seqused_k=seqused_k[:n_dec],
+                    softmax_scale=softmax_scale,
+                    max_seqlen_k=max_seqlen_k,
+                    pages=_cached_decode_pages(n_dec),
+                )
         flash_attn_prefill(
             out=out[n_dec_tok:],
             query=q[n_dec_tok:],
@@ -1080,6 +1275,52 @@ def try_ixformer_unified_attention(
             cu_seqlens_k=_BATCH_SPLIT["prefill_cu_k"],
         )
         return True
+
+    # Pure / unsplitable prefill with HD-major K → transpose to BNDH + FA.
+    if _k_hd and int(max_seqlen_q) > 1:
+        try:
+            from vllm_fl.dispatch.backends.vendor.iluvatar.kv_k_hd_major import (
+                to_bndh_contig,
+            )
+
+            k_fa = to_bndh_contig(k)
+            cu_k = None
+            if (
+                int(_BATCH_SPLIT["num_q_tokens"]) == num_q_tokens
+                and int(_BATCH_SPLIT["batch"]) == batch
+                and int(_BATCH_SPLIT["num_decodes"]) == 0
+            ):
+                cu_k = _BATCH_SPLIT["prefill_cu_k"]
+            flash_attn_prefill(
+                out=out,
+                query=q,
+                key_cache=k_fa,
+                value_cache=v,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                block_table=block_table,
+                softmax_scale=softmax_scale,
+                cu_seqlens_k=cu_k,
+                causal=causal,
+                window_size=window_size if window_size is not None else (-1, -1),
+                softcap=float(softcap or 0.0),
+            )
+            _STATS["prefill"] += 1
+            _log_dispatch(
+                "prefill", q, k, reason="k_hd_major_xpose_fa"
+            )
+            return True
+        except Exception as e:
+            _STATS["layout"] += 1
+            _log_dispatch(
+                "layout",
+                q,
+                k,
+                reason=f"k_hd_major_xpose_fa_exc:{type(e).__name__}",
+            )
+            return False
 
     # Not reordered (or not mixed): mixed or short chunks stay on Triton
     # tile64; pure-prefill FA uses (n_seq, min_q, kv_len) shape gate.
