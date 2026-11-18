@@ -73,11 +73,26 @@ __all__ = ["top_p_threshold"]
 
 # Buckets are uniform in log2-probability, so the resolution follows the softmax
 # weighting rather than being spread evenly across a range that is almost all
-# negligible.  8192 buckets over 40 decades is enough to place the cut within
-# ~0.2% in retained count on real logits.  `lo` also bounds how far below the
-# row maximum a kept token may sit.
+# negligible.  `lo` also bounds how far below the row maximum a kept token may
+# sit.
+#
+# `lo` is also what decides whether the mass kernel's atomics collide.  Every
+# element below `lo` is clamped into bin 0 and issues an atomic into that single
+# address, and real lm_head logits put the *majority* of a 130k vocabulary far
+# below the row maximum, so bin 0 takes most of the traffic.  Measured on
+# BI-V150 (rows=32, vocab 130560, one atomic per element):
+#
+#     lo=-40   gaussian logits 210us | production-like logits 2908us  (87.9% in bin 0)
+#     lo=-120  gaussian logits 175us | production-like logits  208us  (14.0x)
+#
+# A 16k decode trace showed this kernel at 2450us/step, i.e. it was the slowest
+# kernel in the whole step.  Widening the range scatters those elements over
+# genuine buckets instead of one hot address.  The cost is a coarser cut:
+# 120/8192 log2 units = 0.0101 nats per bucket versus 0.0034, both far below the
+# logit spacing that matters for top-p, and the tokens a coarser cut can add are
+# those within 0.01 nats of the boundary.
 _DEFAULT_N_BINS = 8192
-_DEFAULT_LO = -40.0
+_DEFAULT_LO = -120.0
 _DEFAULT_HI = 0.0
 _LN2 = math.log(2.0)
 
