@@ -867,6 +867,7 @@ from flag_gems.ops.tile import tile
 from flag_gems.ops.to import to_copy
 from flag_gems.ops.topk import topk
 from flag_gems.ops.top_p_threshold import top_p_threshold
+from flag_gems.ops.top_p_sample import top_p_sample
 from flag_gems.ops.trace import trace
 from flag_gems.ops.transpose import transpose
 from flag_gems.ops.tril import tril, tril_, tril_out
@@ -1881,6 +1882,7 @@ __all__ = [
     "to_copy",
     "topk",
     "top_p_threshold",
+    "top_p_sample",
     "trace",
     "transpose",
     "tril",
