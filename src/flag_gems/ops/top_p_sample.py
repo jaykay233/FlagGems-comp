@@ -90,7 +90,10 @@ def _top_p_sample_partial_kernel(
     nblk = tl.num_programs(1)
     cols = blk * BLOCK + tl.arange(0, BLOCK)
     m = cols < n_cols
-    x = tl.load(logits + row * stride_r + cols, mask=m, other=float("-inf"))
+    # logits may be bf16 (the caller skipped vLLM's fp32 cast); bf16 is a
+    # subset of fp32, so widening here is exact.
+    x = tl.load(logits + row * stride_r + cols, mask=m, other=float("-inf")).to(
+        tl.float32)
     noise = tl.load(q + row * stride_r + cols, mask=m, other=1.0)
     t = tl.load(thresh + row)
     mx = tl.load(amax + row)
@@ -131,7 +134,7 @@ def top_p_sample(
     ``(top_p_threshold(logits, p).softmax(-1) / q).argmax(-1)``.
 
     Args:
-        logits: 2-D float32 CUDA tensor ``(rows, vocab)``.
+        logits: 2-D float32/bfloat16 CUDA tensor ``(rows, vocab)``.
         p: scalar tensor or 1-D tensor of length ``rows`` in (0, 1].
         q: float32 tensor shaped like ``logits``, holding Exponential(1) noise.
         n_bins, lo, hi, block: top-p bucketing parameters (see
@@ -142,15 +145,18 @@ def top_p_sample(
     """
     if logits.dim() != 2:
         raise ValueError(f"logits must be 2-D, got shape {tuple(logits.shape)}")
-    if logits.dtype != torch.float32:
-        raise ValueError(f"logits must be float32, got {logits.dtype}")
+    if logits.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            f"logits must be float32 or bfloat16, got {logits.dtype}")
     if not logits.is_cuda:
         raise ValueError("logits must be on a CUDA device")
     if logits.stride(-1) != 1:
         raise ValueError("logits must have a contiguous last dimension")
     if not logits.is_contiguous():
         logits = logits.contiguous()
-    if q.shape != logits.shape or q.dtype != logits.dtype:
+    # q stays float32 even when logits are bf16: it is Exponential(1) noise and
+    # an 8-bit mantissa would change near-tie selection.
+    if q.shape != logits.shape or q.dtype != torch.float32:
         raise ValueError("q must be float32 with the same shape as logits")
     if not q.is_contiguous():
         q = q.contiguous()

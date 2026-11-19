@@ -69,3 +69,17 @@ on the same logits.  E2E: 4k +1.67% (B+A), 16k +1.01%; MATH-500 L3 0.9714
 
 * `VLLM_FL_FUSED_TOPP_SAMPLE=0` disables the fused path.
 * `VLLM_FL_FUSED_TOPP_MAX_ROWS` (default 128) bounds it.
+
+## 2026-11-19 — bf16 logits support
+
+`top_p_sample` and the v2 rowmax/mass kernels of `top_p_threshold` now accept
+bfloat16 logits, widening to float32 on load.  bf16 is exactly representable
+in fp32, so the widening is lossless and the sampled token is unchanged.
+`q` remains float32: an 8-bit mantissa on Exponential(1) noise would change
+near-tie selection.
+
+Correctness against the fp32 reference: 0 mismatch for rows 1..128 and
+p in {0.95, 1.0}; bf16 and fp32 paths produce identical token ids.  The plugin
+uses this to elide vLLM's `logits.to(torch.float32)` when only no-op logits
+processors apply (`VLLM_FL_SAMPLER_BF16=0` disables that layer).  E2E:
+4k +0.17%, 16k flat (within noise); MATH-500 L3 0.9810 (103/105).

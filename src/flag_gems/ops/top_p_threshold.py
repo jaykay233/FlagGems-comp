@@ -243,7 +243,8 @@ def _top_p_rowmax_v2_kernel(logits, pmax, n_cols, stride_r, NBLK, BLOCK: tl.cons
     blk = tl.program_id(1)
     cols = blk * BLOCK + tl.arange(0, BLOCK)
     m = cols < n_cols
-    x = tl.load(logits + row * stride_r + cols, mask=m, other=float("-inf"))
+    x = tl.load(logits + row * stride_r + cols, mask=m, other=float("-inf")).to(
+        tl.float32)
     tl.store(pmax + row * NBLK + blk, tl.max(x, axis=0))
 
 
@@ -269,7 +270,8 @@ def _top_p_mass_v2_kernel(
 
     cols = blk * BLOCK + tl.arange(0, BLOCK)
     m = cols < n_cols
-    x = tl.load(logits + row * stride_r + cols, mask=m, other=float("-inf"))
+    x = tl.load(logits + row * stride_r + cols, mask=m, other=float("-inf")).to(
+        tl.float32)
     e = tl.exp(x - row_max)
     bucket = ((x - row_max) * INV_LN2 - LO) / STEP
     bucket = tl.minimum(tl.maximum(bucket, 0.0), N_BINS - 1.0)
