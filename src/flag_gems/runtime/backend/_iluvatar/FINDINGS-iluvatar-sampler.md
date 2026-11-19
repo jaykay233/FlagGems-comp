@@ -62,8 +62,8 @@ All reference selections are inside the top-p kept set.
 | 64 | 1556.0 µs | **538.8 µs** | 1017.2 µs (−65.4%) |
 
 The old chain here is `top_p_threshold` + `softmax` + `probs/q` + `argmax`
-on the same logits.  E2E: 4k +1.67% (B+A), 16k +1.01%; MATH-500 L3 98.06%
-at write time.
+on the same logits.  E2E: 4k +1.67% (B+A), 16k +1.01%; MATH-500 L3 0.9714
+(102/105, gate 0.95).
 
 ### Env (plugin side)
 
