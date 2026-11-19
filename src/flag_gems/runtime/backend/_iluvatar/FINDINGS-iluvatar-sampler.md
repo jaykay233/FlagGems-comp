@@ -83,3 +83,14 @@ p in {0.95, 1.0}; bf16 and fp32 paths produce identical token ids.  The plugin
 uses this to elide vLLM's `logits.to(torch.float32)` when only no-op logits
 processors apply (`VLLM_FL_SAMPLER_BF16=0` disables that layer).  E2E:
 4k +0.17%, 16k flat (within noise); MATH-500 L3 0.9810 (103/105).
+
+## 2026-11-19 — decode GEMM down M=64 uses split-K=4 (`ops/mm.py`)
+
+The Iluvatar mm tuner's config space lists `SPLIT_K=1` only, so split-K was
+never tried.  A graph-captured sweep (42 replays per config) of the four
+decode GEMMs shows only the down projection at M=64 benefits:
+**53.7 → 49.6 µs (+7.7%, 468 → 508 GB/s)** with
+`(BLOCK_M,BLOCK_N,BLOCK_K,SPLIT_K,warps,stages) = (64,128,64,4,8,1)`.
+Every other shape regresses 9–67% under split-K, so only the down entry was
+added to `_SKINNY_MM_LE64`.  E2E 4k 6538.90 → 6555.49 (+0.25%); MATH-500
+L3 0.9810 (103/105); 16k unchanged (M ≤ 32 uses `_SKINNY_MM_LE32`).
